@@ -45,10 +45,13 @@ def shuffle_and_deal(deck: List[dict]) -> (List[dict], List[dict], List[dict]):
 ################################################
 
 def check_win_condition(room):
-    for player_id, hand in room["hands"].items():
+    current_player = room.get("current_turn_id")
+    if current_player is not None:
+        hand = room["hands"].get(current_player, [])
         if len(hand) == 0:
-            return player_id
+            return current_player
     return None
+
 
 ################################################
 # WebSocket処理
