@@ -89,6 +89,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 await broadcast_room(rid)
                 await update_status(rid)
+                await broadcast_room(rid, {"type": "state_update", "room_state": room["state"]})
 
             elif msg_type == "leave_room":
                 await leave_room(player)
@@ -281,6 +282,7 @@ async def leave_room(player):
         player["room"] = None
 
         # ゲーム中の特別処理
+        room = rooms[room_id]
         if room["state"] == "playing":
             # 現在ターンのプレイヤーが切断した場合、次のターンに進める
             if room["current_turn_id"] == player["id"]:
@@ -376,32 +378,35 @@ async def start_game(room):
 # 次のターンに移る
 ################################################
 async def next_turn(room):
-    players = room["players"]
-    if len(players) < 2:
+    # 対戦に参加している（statusが"waiting"の）プレイヤーだけを対象とする
+    active_players = [p for p in room["players"] if p["status"] == "waiting"]
+    if len(active_players) < 2:
         return
-
-    ctid = room["current_turn_id"]
-    # 現在のプレイヤーindexを探す
-    idx = [i for i, p in enumerate(players) if p["id"] == ctid]
-    if not idx:
-        return  # 念のため
 
     # 勝利者がいるかチェック
     winner = check_win_condition(room)
     if winner:
         room["state"] = "waiting"
         # 正しい部屋IDを使ってクライアントへ通知（例：最初のプレイヤーの room キーを利用）
-        await broadcast_room(players[0]["room"], {"type": "game_over", "winner": winner, "state": room["state"]})
+        await broadcast_room(active_players[0]["room"], {"type": "game_over", "winner": winner, "state": room["state"]})
         return
 
-    current_idx = idx[0]
-    next_idx = (current_idx + 1) % len(players)
-    room["current_turn_id"] = players[next_idx]["id"]
+    current_turn_id = room["current_turn_id"]
+    # 現在の手番プレイヤーが active_players の中にいるかを確認
+    idx = [i for i, p in enumerate(active_players) if p["id"] == current_turn_id]
+    if not idx:
+        # もし現在の手番プレイヤーが active でなければ、先頭のプレイヤーに設定
+        room["current_turn_id"] = active_players[0]["id"]
+    else:
+        # 元の順番を無視しているようだが2人対戦の間は大丈夫か？
+        current_idx = idx[0]
+        next_idx = (current_idx + 1) % len(active_players)
+        room["current_turn_id"] = active_players[next_idx]["id"]
 
     # ターンが変わるので、ドロー済みフラグをリセットする
     room["has_drawn"] = False
 
-    await broadcast_room(players[0]["room"], {
+    await broadcast_room(active_players[0]["room"], {
         "type": "next_turn",
         "current_turn": room["current_turn_id"],
         "deck_count": len(room["deck"])  # 山札の枚数を追加
