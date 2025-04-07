@@ -377,6 +377,9 @@ async def start_game(room):
 ################################################
 # 次のターンに移る
 ################################################
+    # ターンが変わるので、ドロー済みフラグをリセットする
+    room["has_drawn"] = False
+
 async def next_turn(room):
     # 対戦に参加している（statusが"waiting"の）プレイヤーだけを対象とする
     active_players = [p for p in room["players"] if p["status"] == "waiting"]
@@ -402,9 +405,6 @@ async def next_turn(room):
         current_idx = idx[0]
         next_idx = (current_idx + 1) % len(active_players)
         room["current_turn_id"] = active_players[next_idx]["id"]
-
-    # ターンが変わるので、ドロー済みフラグをリセットする
-    room["has_drawn"] = False
 
     await broadcast_room(active_players[0]["room"], {
         "type": "next_turn",
