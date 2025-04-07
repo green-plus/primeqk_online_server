@@ -183,6 +183,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         "played_cards": played_cards,
                         "number": number
                     })
+
+                    # チャットにペナルティのログを流す
+                    await log_chat(room, f"プレイヤー{player['id']}が{number}を出そうとしましたが、{number}は素数ではありません")
+
                     await next_turn(room)
                     continue
 
@@ -204,6 +208,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     "played_cards": played_cards,
                     "number": number
                 })
+
+                # チャットに「素数を出した」ログを流す
+                await log_chat(room, f"プレイヤー{player['id']}が{number}を出しました")
                 await next_turn(room)
 
             elif msg_type == "draw_card":
@@ -256,7 +263,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     "action": "pass",
                     "player_id": player["id"]
                 })
-
+                # チャットにパスのログを流す
+                await log_chat(room, f"プレイヤー{player['id']}がパスしました")
                 # 次のターンへ
                 await next_turn(room)
 
@@ -374,13 +382,16 @@ async def start_game(room):
             "current_turn": room["current_turn_id"]
         })
 
+    # チャットにログを流す
+    await log_chat(room, "ゲーム開始！")
+
 ################################################
 # 次のターンに移る
 ################################################
+async def next_turn(room):
     # ターンが変わるので、ドロー済みフラグをリセットする
     room["has_drawn"] = False
 
-async def next_turn(room):
     # 対戦に参加している（statusが"waiting"の）プレイヤーだけを対象とする
     active_players = [p for p in room["players"] if p["status"] == "waiting"]
     if len(active_players) < 2:
@@ -392,6 +403,8 @@ async def next_turn(room):
         room["state"] = "waiting"
         # 正しい部屋IDを使ってクライアントへ通知（例：最初のプレイヤーの room キーを利用）
         await broadcast_room(active_players[0]["room"], {"type": "game_over", "winner": winner, "state": room["state"]})
+        # チャットに勝利ログを流す
+        await log_chat(room, f"プレイヤー {winner} が勝利しました。")
         return
 
     current_turn_id = room["current_turn_id"]
@@ -411,3 +424,16 @@ async def next_turn(room):
         "current_turn": room["current_turn_id"],
         "deck_count": len(room["deck"])  # 山札の枚数を追加
     })
+
+################################################
+# ログをチャットに送信
+################################################
+async def log_chat(room, message, sender="system"):
+    # 部屋内の全プレイヤーへチャットメッセージをブロードキャスト
+    room_id = room["players"][0]["room"] if room["players"] else None
+    if room_id:
+        await broadcast_room(room_id, {
+            "type": "chat",
+            "sender": sender,
+            "message": message
+        })
