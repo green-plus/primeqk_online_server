@@ -36,9 +36,23 @@ class Player:
         """WebSocketを通じてJSONメッセージを送信する"""
         await self.ws.send_json(message)
 
+    async def send_hand_update(self):
+        """手札の変更通知をクライアントに送信する"""
+        message = {
+            "type": "hand_update",
+            "your_hand": self.hand
+        }
+        await self.send_json(message)
+
+    def sort_hand(self):
+        """手札をランク順（必要に応じてスートも考慮）に並び替える"""
+        # ここでは単純にカードの"rank"で昇順にソート
+        self.hand.sort(key=lambda card: card["rank"])
+
     def add_card(self, card: dict):
         """手札にカードを追加する"""
         self.hand.append(card)
+        self.sort_hand()  # カード追加後に手札を並び替え
 
     def remove_card(self, card: dict) -> bool:
         """手札から指定のカードを削除する。存在すればTrue、なければFalseを返す"""
@@ -46,6 +60,25 @@ class Player:
             self.hand.remove(card)
             return True
         return False
+
+    def has_cards(self, cards: List[dict]) -> bool:
+        """指定されたカード群が自分の手札に存在するかチェックする"""
+        temp = self.hand[:]  # コピーを使ってチェック
+        for card in cards:
+            if card in temp:
+                temp.remove(card)
+            else:
+                return False
+        return True
+
+    def remove_cards(self, cards: List[dict]) -> bool:
+        """指定されたカード群を手札から削除する。すべて削除できた場合にTrueを返す"""
+        if not self.has_cards(cards):
+            return False
+        for card in cards:
+            self.remove_card(card)
+        return True
+
 
     def clear_hand(self):
         """手札をクリアする"""
@@ -161,16 +194,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     number = -1
 
                 # 手札にあるか検証
-                temp_hand = player.hand[:]
-                can_play = True
-                for c in played_cards:
-                    if c in temp_hand:
-                        temp_hand.remove(c)
-                    else:
-                        can_play = False
-                        break
-                if not can_play:
-                    await websocket.send_json({"type": "error", "message": "そのカードは手札にありません。"})
+                if not player.has_cards(played_cards):
+                    await player.ws.send_json({"type": "error", "message": "そのカードは手札にありません。"})
                     continue
 
                 # もしフィールドに既にカードが出ているなら、枚数と数の検証を行う
@@ -197,12 +222,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     # 出そうとしたカードを引き直すことはしない(そもそも出されていないため)
                     if room["deck"]:
                         drawn = room["deck"].pop(0)
-                        player.hand.append(drawn)
+                        player.add_card(drawn)
 
-                    await player.ws.send_json({
-                        "type": "hand_update",
-                        "your_hand": player.hand
-                    })
+                    await player.send_hand_update()
 
                     # フィールドをリセット（場のカードを消す）2人対戦想定であることに注意
                     room["field"] = []
@@ -222,13 +244,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 # 素数なら場に出す
                 for c in played_cards:
-                    player.hand.remove(c)
+                    player.remove_card(c)
                 room["field"] = played_cards
 
-                await player.ws.send_json({
-                    "type": "hand_update",
-                    "your_hand": player.hand
-                })
+                await player.send_hand_update()
 
 
                 await broadcast_room(room_id, {
@@ -259,13 +278,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 # ドロー処理
                 if len(room["deck"]) > 0:
                     drawn = room["deck"].pop(0)
-                    player.hand.append(drawn)
+                    player.add_card(drawn)
 
                     # 自分に手札更新を送る
-                    await player.ws.send_json({
-                        "type": "hand_update",
-                        "your_hand": player.hand
-                    })
+                    await player.send_hand_update()
 
                 # ドロー済みフラグを設定（このターンはこれ以上ドローできない）
                 room["has_drawn"] = True
@@ -279,10 +295,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "message": "あなたのターンではありません。"})
                     continue
 
-                await player.ws.send_json({
-                    "type": "hand_update",
-                    "your_hand": player.hand
-                })
+                await player.send_hand_update()
 
                 # パスの場合もフィールドをリセット
                 room["field"] = []
@@ -389,6 +402,9 @@ async def start_game(room):
     p2.hand = hand2
     room["field"] = []  # 場のカードは空
 
+    p1.sort_hand()
+    p2.sort_hand()
+
     room["state"] = "playing"
 
     # ランダムに先攻プレイヤー決定
@@ -434,7 +450,7 @@ async def next_turn(room):
         # 正しい部屋IDを使ってクライアントへ通知（例：最初のプレイヤーの room キーを利用）
         await broadcast_room(active_players[0].room, {"type": "game_over", "winner": winner, "state": room["state"]})
         # チャットに勝利ログを流す
-        await log_chat(room, f"プレイヤー {winner} が勝利しました。")
+        await log_chat(room, f"プレイヤー{winner} が勝利しました。")
         return
 
     current_turn_id = room["current_turn_id"]
