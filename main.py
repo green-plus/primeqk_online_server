@@ -26,14 +26,32 @@ class Room:
         for p in self.players:
             await p.send_json(message)
 
-    async def update_status(self):
-        waiting_count = len([p for p in self.players if p.status == "waiting"])
-        await self.broadcast({"type": "status_update", "waiting_count": waiting_count})
+    async def update_room_status(self):
+        message = {
+            "type": "update_room_status",
+            "room_id": self.room_id,
+            "count": len(self.players),
+            "player_list": [{"id": p.id, "status": p.status} for p in self.players],
+            "waiting_count": len([p for p in self.players if p.status == "waiting"])
+        }
+        await self.broadcast(message)
 
     async def log_chat(self, message: str, sender="system"):
         await self.broadcast({"type": "chat", "sender": sender, "message": message})
 
     # その他、ルームに関連するロジック（プレイヤー追加、削除、ゲーム開始、次のターンなど）をメソッドとして実装
+    async def update_game_state(self):
+        state_msg = {
+            "type": "game_update",
+            "room_id": self.room_id,
+            "state": self.state,
+            "current_turn": self.current_turn_id,
+            "deck_count": len(self.deck),
+            "field": self.field,
+            "player_list": [{"id": p.id, "status": p.status} for p in self.players]
+        }
+        await self.broadcast(state_msg)
+
 
 # アプリケーションの初期化時にRoomインスタンスを必要な数だけ作成しておく
 rooms: Dict[str, Room] = {f"room_{i}": Room(f"room_{i}") for i in range(1, 6)}
@@ -163,14 +181,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 player.room = room
                 player.status = "watching"  # 仮に入室したらwatchingに
 
-                await room.broadcast({
-                    "type": "update_room",
-                    "room_id": room.room_id,
-                    "count": len(room.players),
-                    "player_list": [{"id": p.id, "status": p.status} for p in room.players]
-                })
-                await room.update_status()
-                await room.broadcast({"type": "state_update", "room_state": room.state})
+                await room.update_room_status()
+                await room.broadcast({"type": "room_state_initialization", "room_state": room.state})
 
             elif msg_type == "leave_room":
                 await leave_room(player)
@@ -180,13 +192,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 new_status = data["status"]
                 player.status = new_status
-                await room.broadcast({
-                    "type": "update_room",
-                    "room_id": room.room_id,
-                    "count": len(room.players),
-                    "player_list": [{"id": p.id, "status": p.status} for p in room.players]
-                })
-                await room.update_status()
+                await room.update_room_status()
 
             elif msg_type == "start_game":
                 if not player.room:
@@ -350,13 +356,21 @@ async def websocket_endpoint(websocket: WebSocket):
 # 部屋からの退出
 ################################################
 async def leave_room(player):
+    # デバッグ用にplayer.roomの状態を出力
+    print(f"DEBUG: player.room before leave_room: {player.room}")
+
+    # もしNoneの場合は注意喚起のログも出す
+    if player.room is None:
+        print("DEBUG: player.room is None; cannot proceed with leave_room processing")
+
     room_id = player.room.room_id
     if room_id and player in rooms[room_id].players:
+        room = player.room
         rooms[room_id].players.remove(player)
         player.room = None
 
         # ゲーム中の特別処理
-        room = player.room
+
         if room.state == "playing":
             # 現在ターンのプレイヤーが切断した場合、次のターンに進める
             if room.current_turn_id == player.id:
@@ -368,15 +382,9 @@ async def leave_room(player):
                 await room.broadcast({"type": "game_over", "winner": winner_id})
                 room.state = "waiting"
 
-        update_message = {
-            "type": "update_room",
-            "room_id": room_id,
-            "count": len(rooms[room_id]["players"]),
-            "player_list": [{"id": p.id, "status": p.status} for p in rooms[room_id].players]
-        }
-        await room.broadcast(update_message)
-        await player.ws.send_json(update_message)
-        await room.update_status()
+        # 改めて抜けたプレイヤーには各roomの人数を送る機能を追加
+        await room.update_room_status()
+
 
 ################################################
 # ゲーム開始処理
