@@ -48,7 +48,8 @@ class Room:
             "current_turn": self.current_turn_id,
             "deck_count": len(self.deck),
             "field": self.field,
-            "player_list": [{"id": p.id, "status": p.status} for p in self.players]
+            "player_list": [{"id": p.id, "status": p.status} for p in self.players],
+            "hand_counts": [{"id": p.id, "count": len(p.hand)} for p in self.players]
         }
         await self.broadcast(state_msg)
 
@@ -312,10 +313,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # 自分に手札更新を送る
                     await player.send_hand_update()
-
-                # ドロー済みフラグを設定（このターンはこれ以上ドローできない）
-                room.has_drawn = True
-                # ※ここでは next_turn(room) は呼ばない → 手番は変わらない
+                    await room.update_game_state()
+                    # ドロー済みフラグを設定（このターンはこれ以上ドローできない）
+                    room.has_drawn = True
+                    # ※ここでは next_turn(room) は呼ばない → 手番は変わらない
 
             elif msg_type == "pass":
                 if not player.room:
@@ -428,6 +429,7 @@ async def start_game(room):
         "your_hand": p2.hand
     })
 
+    await room.update_game_state()
     # 全体にゲーム開始メッセージ & 現在のターン情報
     await room.broadcast({
         "type": "game_start",
@@ -437,6 +439,7 @@ async def start_game(room):
 
     # チャットにログを流す
     await room.log_chat("ゲーム開始！")
+
 
 ################################################
 # 次のターンに移る
@@ -472,8 +475,8 @@ async def next_turn(room):
         next_idx = (current_idx + 1) % len(active_players)
         room.current_turn_id = active_players[next_idx].id
 
-    await active_players[0].room.broadcast({
+    # await room.update_game_state() それぞれのアクションで既に呼び出されているので省略
+    await room.broadcast({
         "type": "next_turn",
         "current_turn": room.current_turn_id,
-        "deck_count": len(room.deck)  # 山札の枚数を追加
     })
