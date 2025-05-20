@@ -258,6 +258,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # フィールドをリセット（場のカードを消す）2人対戦想定であることに注意
                     room.field = []
 
+                    await room.update_game_state()
                     await room.broadcast( {
                         "type": "penalty",
                         "player_id": player.id,
@@ -278,7 +279,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 await player.send_hand_update()
 
-
+                await room.update_game_state()
                 await room.broadcast({
                     "type": "action_result",
                     "action": "play_card",
@@ -330,6 +331,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 room.field = []
 
                 # passの通知
+                await room.update_game_state()
                 await room.broadcast({
                     "type": "action_result",
                     "action": "pass",
@@ -427,12 +429,11 @@ async def start_game(room):
     })
 
     # 全体にゲーム開始メッセージ & 現在のターン情報
-    for p in room.players:
-        await p.ws.send_json({
-            "type": "game_start",
-            "message": "ゲーム開始!",
-            "current_turn": room.current_turn_id
-        })
+    await room.broadcast({
+        "type": "game_start",
+        "message": "ゲーム開始!",
+        "current_turn": room.current_turn_id
+    })
 
     # チャットにログを流す
     await room.log_chat("ゲーム開始！")
@@ -453,8 +454,8 @@ async def next_turn(room):
     winner = check_win_condition(room)
     if winner:
         room.state = "waiting"
-        # 正しい部屋IDを使ってクライアントへ通知（例：最初のプレイヤーの room キーを利用）
-        await active_players[0].room.broadcast({"type": "game_over", "winner": winner, "state": room.state})
+        # クライアントへ通知
+        await room.broadcast({"type": "game_over", "winner": winner, "state": room.state})
         # チャットに勝利ログを流す
         await room.log_chat(f"プレイヤー{winner} が勝利しました。")
         return
