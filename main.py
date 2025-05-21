@@ -4,6 +4,10 @@ import random
 
 app = FastAPI()
 
+################################################
+# 素数判定
+################################################
+
 def is_prime(n: int) -> bool:
     if n < 2:
         return False
@@ -11,6 +15,10 @@ def is_prime(n: int) -> bool:
         if n % i == 0:
             return False
     return True
+
+################################################
+# クラス定義
+################################################
 
 class Room:
     def __init__(self, room_id: str):
@@ -52,6 +60,16 @@ class Room:
             "hand_counts": [{"id": p.id, "count": len(p.hand)} for p in self.players]
         }
         await self.broadcast(state_msg)
+
+    async def try_end_game(self) -> bool:
+        """勝者がいれば game_over を投げて True、なければ False を返す"""
+        winner = check_win_condition(self)
+        if winner is not None:
+            self.state = "waiting"
+            await self.broadcast({"type": "game_over", "winner": winner, "state": self.state})
+            await self.log_chat(f"プレイヤー{winner}が勝利しました")
+            return True
+        return False
 
 
 # アプリケーションの初期化時にRoomインスタンスを必要な数だけ作成しておく
@@ -117,6 +135,26 @@ class Player:
         self.hand = []
 
 ################################################
+# 勝敗判定ロジック
+################################################
+
+def check_win_condition(room):
+    # 1. プレイヤー1人による特殊勝利
+    if len(room.players) == 1:
+        return room.players[0].id
+    # 2. 現在プレイヤーの手札0枚による通常勝利
+    current_turn_id = room.current_turn_id
+    if current_turn_id is None:
+        return None
+    # room.playersはPlayerオブジェクトのリストであるとする
+    current_player = next((p for p in room.players if p.id == current_turn_id), None)
+    if current_player is not None:
+        if len(current_player.hand) == 0:
+            # 勝利者のIDまたはPlayerオブジェクトそのものを返す（要件に応じて）
+            return current_player.id
+    return None
+
+################################################
 # カード生成と配布のユーティリティ
 ################################################
 def generate_deck() -> List[dict]:
@@ -132,21 +170,6 @@ def shuffle_and_deal(deck: List[dict]) -> (List[dict], List[dict], List[dict]):
     remaining_deck = deck[10:]
     return hand1, hand2, remaining_deck
 
-################################################
-# 勝敗判定ロジック
-################################################
-
-def check_win_condition(room):
-    current_turn_id = room.current_turn_id
-    if current_turn_id is None:
-        return None
-    # room.playersはPlayerオブジェクトのリストであるとする
-    current_player = next((p for p in room.players if p.id == current_turn_id), None)
-    if current_player is not None:
-        if len(current_player.hand) == 0:
-            # 勝利者のIDまたはPlayerオブジェクトそのものを返す（要件に応じて）
-            return current_player.id
-    return None
 
 ################################################
 # WebSocket処理
@@ -177,6 +200,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 if len(room.players) >= 10:
                     await websocket.send_json({"type": "error", "message": "部屋が満員です。"})
                     continue
+
+                await room.log_chat(f"プレイヤー{player.id}が入室しました")
 
                 room.players.append(player)
                 player.room = room
@@ -245,6 +270,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     if number <= field_number:
                         await websocket.send_json({"type": "error", "message": "場より小さい。"})
                         continue
+
+                # グロタンカット
+                if number == 57:
+                    # 場をリセット
+                    for c in played_cards:
+                        player.remove_card(c)
+                    room.field = []
+                    # 自分の手番を継続するため next_turn は呼ばない
+                    room.has_drawn = False
+                    # クライアントの表示を更新
+                    await player.send_hand_update()
+                    await room.log_chat(f"プレイヤー{player.id}が57を出しました、グロタンカット！")
+                    await room.update_game_state()
+                    if await room.try_end_game():
+                        await room.update_room_status()
+                        continue
+                    continue  # 次の処理（素数判定～next_turn）をすべてスキップ
 
                 # 素数判定
                 if not is_prime(number):
@@ -372,18 +414,20 @@ async def leave_room(player):
         rooms[room_id].players.remove(player)
         player.room = None
 
+        # 退出通知
+        await room.log_chat(f"プレイヤー{player.id}が退室しました")
         # ゲーム中の特別処理
-
         if room.state == "playing":
             # 現在ターンのプレイヤーが切断した場合、次のターンに進める
             if room.current_turn_id == player.id:
                 await next_turn(room)
-
             # 参加プレイヤーが1人だけになったら、ゲーム終了
             if len(room.players) == 1:
                 winner_id = room.players[0].id
                 await room.broadcast({"type": "game_over", "winner": winner_id})
+                await room.log_chat(f"プレイヤー{winner_id}が勝利しました")
                 room.state = "waiting"
+
 
         # 改めて抜けたプレイヤーには各roomの人数を送る機能を追加
         await room.update_room_status()
@@ -430,10 +474,9 @@ async def start_game(room):
     })
 
     await room.update_game_state()
-    # 全体にゲーム開始メッセージ & 現在のターン情報
+    # 全体にゲーム開始 & 現在のターン情報
     await room.broadcast({
         "type": "game_start",
-        "message": "ゲーム開始!",
         "current_turn": room.current_turn_id
     })
 
@@ -453,14 +496,8 @@ async def next_turn(room):
     if len(active_players) < 2:
         return
 
-    # 勝利者がいるかチェック
-    winner = check_win_condition(room)
-    if winner:
-        room.state = "waiting"
-        # クライアントへ通知
-        await room.broadcast({"type": "game_over", "winner": winner, "state": room.state})
-        # チャットに勝利ログを流す
-        await room.log_chat(f"プレイヤー{winner} が勝利しました。")
+    if await room.try_end_game():
+        await room.update_room_status()
         return
 
     current_turn_id = room.current_turn_id
