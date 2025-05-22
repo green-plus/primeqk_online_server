@@ -1,6 +1,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import Dict, List
 import random
+import secrets
 
 app = FastAPI()
 
@@ -39,7 +40,10 @@ class Room:
             "type": "update_room_status",
             "room_id": self.room_id,
             "count": len(self.players),
-            "player_list": [{"id": p.id, "status": p.status} for p in self.players],
+            "player_list": [
+                {"id": p.id, "name": p.name, "status": p.status}
+                for p in self.players
+            ],
             "waiting_count": len([p for p in self.players if p.status == "waiting"])
         }
         await self.broadcast(message)
@@ -49,15 +53,17 @@ class Room:
 
     # その他、ルームに関連するロジック（プレイヤー追加、削除、ゲーム開始、次のターンなど）をメソッドとして実装
     async def update_game_state(self):
+        current_player = next((p for p in self.players if p.id == self.current_turn_id), None)
+        current_name = current_player.name if current_player else None
         state_msg = {
             "type": "game_update",
             "room_id": self.room_id,
             "state": self.state,
-            "current_turn": self.current_turn_id,
+            "current_turn": current_name,
             "deck_count": len(self.deck),
             "field": self.field,
-            "player_list": [{"id": p.id, "status": p.status} for p in self.players],
-            "hand_counts": [{"id": p.id, "count": len(p.hand)} for p in self.players]
+            "player_list": [{"id": p.id, "name": p.name, "status": p.status} for p in self.players],
+            "hand_counts": [{"id": p.id, "name": p.name, "count": len(p.hand)} for p in self.players]
         }
         await self.broadcast(state_msg)
 
@@ -67,7 +73,7 @@ class Room:
         if winner is not None:
             self.state = "waiting"
             await self.broadcast({"type": "game_over", "winner": winner, "state": self.state})
-            await self.log_chat(f"プレイヤー{winner}が勝利しました")
+            await self.log_chat(f"{winner}が勝利しました")
             return True
         return False
 
@@ -78,7 +84,9 @@ rooms: Dict[str, Room] = {f"room_{i}": Room(f"room_{i}") for i in range(1, 6)}
 class Player:
     def __init__(self, ws: WebSocket):
         self.ws = ws
-        self.id = id(ws)  # 現状は接続オブジェクトのidを利用
+        self.id = secrets.token_hex(16)
+        suffix = int(self.id, 16) % 10000
+        self.name = f"プレイヤー{suffix:04d}"
         self.room = None  # 所属ルーム（Roomオブジェクト）
         self.status = "watching"  # 初期状態は観戦中
         self.hand = []  # プレイヤーが持つカードリスト
@@ -141,7 +149,7 @@ class Player:
 def check_win_condition(room):
     # 1. プレイヤー1人による特殊勝利
     if len(room.players) == 1:
-        return room.players[0].id
+        return room.players[0].name
     # 2. 現在プレイヤーの手札0枚による通常勝利
     current_turn_id = room.current_turn_id
     if current_turn_id is None:
@@ -151,7 +159,7 @@ def check_win_condition(room):
     if current_player is not None:
         if len(current_player.hand) == 0:
             # 勝利者のIDまたはPlayerオブジェクトそのものを返す（要件に応じて）
-            return current_player.id
+            return current_player.name
     return None
 
 ################################################
@@ -189,7 +197,13 @@ async def websocket_endpoint(websocket: WebSocket):
             msg_type = data.get("type")
             room_id = player.room.room_id if player.room else None
 
-            if msg_type == "get_room_counts":
+            if msg_type == "set_name":
+                # クライアントから名前を受け取る
+                player.name = data.get("name", "").strip() or f"プレイヤー{player.id}"
+                # 必要なら acknowledgment を返す
+                await player.send_json({"type": "name_set", "name": player.name})
+                continue
+            elif msg_type == "get_room_counts":
                 counts = {room_id: len(room.players) for room_id, room in rooms.items()}
                 await websocket.send_json({"type": "room_counts", "counts": counts})
 
@@ -201,7 +215,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "message": "部屋が満員です。"})
                     continue
 
-                await room.log_chat(f"プレイヤー{player.id}が入室しました")
+                await room.log_chat(f"{player.name}が入室しました")
 
                 room.players.append(player)
                 player.room = room
@@ -281,7 +295,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     room.has_drawn = False
                     # クライアントの表示を更新
                     await player.send_hand_update()
-                    await room.log_chat(f"プレイヤー{player.id}が57を出しました、グロタンカット！")
+                    await room.log_chat(f"{player.name}が57を出しました、グロタンカット！")
                     await room.update_game_state()
                     if await room.try_end_game():
                         await room.update_room_status()
@@ -310,7 +324,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
 
                     # チャットにペナルティのログを流す
-                    await room.log_chat(f"プレイヤー{player.id}が{number}を出そうとしましたが、{number}は素数ではありません")
+                    await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は素数ではありません")
 
                     await next_turn(room)
                     continue
@@ -332,7 +346,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
                 # チャットに「素数を出した」ログを流す
-                await room.log_chat(f"プレイヤー{player.id}が{number}を出しました")
+                await room.log_chat(f"{player.name}が{number}を出しました")
                 await next_turn(room)
 
             elif msg_type == "draw_card":
@@ -381,16 +395,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     "player_id": player.id
                 })
                 # チャットにパスのログを流す
-                await room.log_chat(f"プレイヤー{player.id}がパスしました")
+                await room.log_chat(f"{player.name}がパスしました")
                 # 次のターンへ
                 await next_turn(room)
 
             elif msg_type == "chat":
                 if not player.room:
                     continue
+                # 表示用に「プレイヤー」を追加
+                display_sender = f"{player.name}"
                 await room.broadcast({
                     "type": "chat",
-                    "sender": player.id,
+                    "sender": display_sender,
                     "message": data["message"]
                 })
 
@@ -415,7 +431,7 @@ async def leave_room(player):
         player.room = None
 
         # 退出通知
-        await room.log_chat(f"プレイヤー{player.id}が退室しました")
+        await room.log_chat(f"{player.name}が退室しました")
         # ゲーム中の特別処理
         if room.state == "playing":
             # 現在ターンのプレイヤーが切断した場合、次のターンに進める
@@ -423,9 +439,9 @@ async def leave_room(player):
                 await next_turn(room)
             # 参加プレイヤーが1人だけになったら、ゲーム終了
             if len(room.players) == 1:
-                winner_id = room.players[0].id
-                await room.broadcast({"type": "game_over", "winner": winner_id})
-                await room.log_chat(f"プレイヤー{winner_id}が勝利しました")
+                winner_name = room.players[0].name
+                await room.broadcast({"type": "game_over", "winner": winner_name})
+                await room.log_chat(f"{winner_name}が勝利しました")
                 room.state = "waiting"
 
 
@@ -473,13 +489,12 @@ async def start_game(room):
         "your_hand": p2.hand
     })
 
-    await room.update_game_state()
     # 全体にゲーム開始 & 現在のターン情報
     await room.broadcast({
         "type": "game_start",
-        "current_turn": room.current_turn_id
-    })
 
+    })
+    await room.update_game_state()
     # チャットにログを流す
     await room.log_chat("ゲーム開始！")
 
@@ -513,7 +528,9 @@ async def next_turn(room):
         room.current_turn_id = active_players[next_idx].id
 
     # await room.update_game_state() それぞれのアクションで既に呼び出されているので省略
+    # 次のプレイヤー名を取得して送信
+    next_player = next((p for p in room.players if p.id == room.current_turn_id), None)
     await room.broadcast({
         "type": "next_turn",
-        "current_turn": room.current_turn_id,
+        "current_turn": next_player.name if next_player else None,
     })
