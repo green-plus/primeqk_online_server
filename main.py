@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import Dict, List
 import random
 import secrets
+import uuid
 
 app = FastAPI()
 
@@ -28,8 +29,10 @@ class Room:
         self.state = "waiting"
         self.deck = []
         self.field = []      # 場に出ているカード
+        self.last_number = None     # “場に出ている”最後の数値を保持
         self.current_turn_id = None
         self.has_drawn = False
+        self.reverse_order = False
 
     async def broadcast(self, message: dict):
         for p in self.players:
@@ -60,6 +63,7 @@ class Room:
             "room_id": self.room_id,
             "state": self.state,
             "current_turn": current_name,
+            "revolution": self.reverse_order,
             "deck_count": len(self.deck),
             "field": self.field,
             "player_list": [{"id": p.id, "name": p.name, "status": p.status} for p in self.players],
@@ -166,9 +170,24 @@ def check_win_condition(room):
 # カード生成と配布のユーティリティ
 ################################################
 def generate_deck() -> List[dict]:
-    deck = [{"suit": suit, "rank": rank} for suit in ["S", "H", "D", "C"] for rank in range(1, 14)]
-    # ルールの簡略化のためジョーカーを入れない
-    # deck += [{"suit": "J", "rank": 0}, {"suit": "J", "rank": 0}]
+    deck = []
+    for suit in ["S","H","D","C"]:
+        for rank in range(1,14):
+            deck.append({
+                "card_id": str(uuid.uuid4()),
+                "suit": suit,
+                "rank": rank,
+                "is_joker": False
+            })
+    # ジョーカー２枚にも同様にIDを
+    for _ in range(2):
+        deck.append({
+            "card_id": str(uuid.uuid4()),
+            "suit": "X",
+            "rank": 0,
+            "is_joker": True
+        })
+    random.shuffle(deck)
     return deck
 
 def shuffle_and_deal(deck: List[dict]) -> (List[dict], List[dict], List[dict]):
@@ -256,16 +275,72 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 played_cards = data.get("cards", [])
-                ranks_str = "".join(str(c["rank"]) for c in played_cards)
-                try:
-                    number = int(ranks_str)
-                except ValueError:
-                    number = -1
-
                 # 手札にあるか検証
                 if not player.has_cards(played_cards):
                     await player.ws.send_json({"type": "error", "message": "そのカードは手札にありません。"})
                     continue
+
+                # ジョーカー絡みの処理
+                assigned_numbers = data.get("assigned_numbers", [])  # [ "inf" か 0〜13, ... ]
+                # ―――――――――――――――――――
+                # １）ジョーカーだけを単独で出す (グロタンカット相当)
+                jokers = [c for c in played_cards if c["suit"] == "X"]
+                if len(jokers) == 1 and len(played_cards) == 1:
+                    # ジョーカー1枚だけ → 場を流す
+                    player.remove_card(jokers[0])
+                    room.field = []
+                    room.last_number = None
+                    room.has_drawn = False
+                    await player.send_hand_update()
+                    await room.log_chat(f"{player.name}がジョーカーを出しました、インフィニティ！")
+                    await room.update_game_state()
+                    if await room.try_end_game():
+                        await room.update_room_status()
+                    continue  # ターン継続
+                # ２）ジョーカーを含む複数枚プレイ時は、置換して number を作成
+                if jokers:
+                    if len(assigned_numbers) != len(jokers):
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "ジョーカーの数字指定が不足しています。"
+                        })
+                        continue
+                    if any(v == "inf" for v in assigned_numbers):
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "複数枚出し時に「∞」指定はできません。"
+                        })
+                        continue
+                    ranks = []
+                    joker_i = 0
+                    for c in played_cards:
+                        if c["suit"] == "X":
+                            val = assigned_numbers[joker_i]
+                            joker_i += 1
+                            ranks.append(str(val))
+                        else:
+                            ranks.append(str(c["rank"]))
+                    ranks_str = "".join(ranks)
+
+                    # 先頭が 0 の数字は許可しない
+                    if ranks_str.startswith("0"):
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "最上位桁が0の数字は出せません。"
+                        })
+                        continue
+
+                    try:
+                        number = int(ranks_str)
+                    except ValueError:
+                        number = -1
+                else:
+                    # 通常カードのみ
+                    ranks_str = "".join(str(c["rank"]) for c in played_cards)
+                    try:
+                        number = int(ranks_str)
+                    except ValueError:
+                        number = -1
 
                 # もしフィールドに既にカードが出ているなら、枚数と数の検証を行う
                 if room.field:
@@ -275,15 +350,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         continue
 
                     # ② 数値チェック：フィールドのカードと比較
-                    field_ranks_str = "".join(str(c["rank"]) for c in room.field)
-                    try:
-                        field_number = int(field_ranks_str)
-                    except ValueError:
-                        field_number = -1
+                    field_number = room.last_number if room.last_number is not None else -1
 
-                    if number <= field_number:
-                        await websocket.send_json({"type": "error", "message": "場より小さい。"})
-                        continue
+                    # 通常は「>」が必要、反転中は「<」を要求
+                    if not room.reverse_order:
+                        if number <= field_number:
+                            await websocket.send_json({"type": "error", "message": "場より大きい数字を出してください。"})
+                            continue
+                    else:
+                        if number >= field_number:
+                            await websocket.send_json({"type": "error", "message": "場より小さい数字を出してください。(ラマヌジャン革命中)"})
+                            continue
 
                 # グロタンカット
                 if number == 57:
@@ -301,7 +378,24 @@ async def websocket_endpoint(websocket: WebSocket):
                         await room.update_room_status()
                         continue
                     continue  # 次の処理（素数判定～next_turn）をすべてスキップ
+                if number == 1729:
+                    # フラグをトグル
+                    room.reverse_order = not room.reverse_order
+                    # カードを場に出す
+                    for c in played_cards:
+                        player.remove_card(c)
+                    room.field = played_cards
+                    room.last_number = number
 
+                    # 手札更新 & ゲーム状態通知
+                    await player.send_hand_update()
+                    await room.update_game_state()
+                    # ログ
+                    await room.log_chat(f"{player.name}が1729を出しました、ラマヌジャン革命！")
+
+                    # 通常の素数出しと同じく次のターンへ
+                    await next_turn(room)
+                    continue
                 # 素数判定
                 if not is_prime(number):
                     # ペナルティ
@@ -314,6 +408,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # フィールドをリセット（場のカードを消す）2人対戦想定であることに注意
                     room.field = []
+                    room.last_number = None
 
                     await room.update_game_state()
                     await room.broadcast( {
@@ -333,6 +428,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 for c in played_cards:
                     player.remove_card(c)
                 room.field = played_cards
+                room.last_number = number
 
                 await player.send_hand_update()
 
@@ -386,6 +482,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 # パスの場合もフィールドをリセット
                 room.field = []
+                room.last_number = None
 
                 # passの通知
                 await room.update_game_state()
@@ -453,6 +550,8 @@ async def leave_room(player):
 # ゲーム開始処理
 ################################################
 async def start_game(room):
+    room.reverse_order = False     # 革命向きは通常に戻す
+    room.has_drawn = False         # ドロー済みフラグもクリア
     # 1) デッキを生成＆シャッフル＆配布
     deck = generate_deck()
     hand1, hand2, remaining_deck = shuffle_and_deal(deck)
@@ -470,6 +569,7 @@ async def start_game(room):
     p1.hand = hand1
     p2.hand = hand2
     room.field = []  # 場のカードは空
+    room.last_number = None
 
     p1.sort_hand()
     p2.sort_hand()
