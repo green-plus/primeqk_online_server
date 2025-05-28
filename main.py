@@ -3,7 +3,10 @@ from typing import Dict, List
 import random
 import secrets
 import uuid
+import asyncio
+import os, httpx
 
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 app = FastAPI()
 
 ################################################
@@ -197,6 +200,21 @@ def shuffle_and_deal(deck: List[dict]) -> (List[dict], List[dict], List[dict]):
     remaining_deck = deck[10:]
     return hand1, hand2, remaining_deck
 
+################################################
+# Webhook
+################################################
+
+async def notify_discord(content: str):
+    if not WEBHOOK_URL:
+        print("⚠️ Webhook URL が設定されていません")
+        return
+
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(WEBHOOK_URL, json={"content": content})
+    except Exception as e:
+        # エラーをハンドリング
+        print("notify_discord failed:", e)
 
 ################################################
 # WebSocket処理
@@ -235,6 +253,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 await room.log_chat(f"{player.name}が入室しました")
+                # 同期処理の後で、バックグラウンドに通知タスクを投げる
+                asyncio.create_task(
+                    notify_discord(f"🎮 {player.name} が {room.room_id} に参加しました")
+                )
+
 
                 room.players.append(player)
                 player.room = room
