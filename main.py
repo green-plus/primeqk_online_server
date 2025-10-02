@@ -1,6 +1,8 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import Dict, List
+from typing import Dict, List, Tuple
+from rules import PRESETS, RulePreset, DeckRule, PenaltyRule
 import random
+from random import randrange
 import secrets
 import uuid
 import asyncio
@@ -13,11 +15,45 @@ app = FastAPI()
 # 素数判定
 ################################################
 
-def is_prime(n: int) -> bool:
+_SMALL_PRIMES = (2,3,5,7,11,13,17,19,23,29,31,37)
+
+def is_prime(n: int, k: int = 16) -> bool:
     if n < 2:
         return False
-    for i in range(2, int(n**0.5) + 1):
-        if n % i == 0:
+    # 小素数チェック（高速化 & 明確化）
+    for p in _SMALL_PRIMES:
+        if n == p:
+            return True
+        if n % p == 0:
+            return False
+
+    # n-1 = d * 2^s
+    m = n - 1
+    lsb = m & -m
+    s = lsb.bit_length() - 1
+    d = m // lsb
+
+    def check(a: int) -> bool:
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            return True
+        for _ in range(s - 1):
+            x = (x * x) % n
+            if x == n - 1:
+                return True
+        return False  # 合成数確定
+
+    # 2^64 未満は決定的な既知の底集合で完全判定
+    if n < (1 << 64):
+        for a in (2,3,5,7,11,13,17,19,23,29,31,37):
+            if not check(a):
+                return False
+        return True
+
+    # それ以上（=72桁含む）は確率的に k ラウンド
+    for _ in range(k):
+        a = randrange(2, n - 1)
+        if not check(a):
             return False
     return True
 
@@ -26,12 +62,14 @@ def is_prime(n: int) -> bool:
 ################################################
 
 class Room:
-    def __init__(self, room_id: str):
+    def __init__(self, room_id: str, rule: RulePreset):
         self.room_id = room_id
+        self.rule: RulePreset = rule
         self.players = []    # Playerオブジェクトのリスト
         self.state = "waiting"
         self.deck = []
         self.field = []      # 場に出ているカード
+        self.reserve = [] # 山札予備軍
         self.last_number = None     # “場に出ている”最後の数値を保持
         self.current_turn_id = None
         self.has_drawn = False
@@ -45,6 +83,7 @@ class Room:
         message = {
             "type": "update_room_status",
             "room_id": self.room_id,
+            "rule": self.rule.label,
             "count": len(self.players),
             "player_list": [
                 {"id": p.id, "name": p.name, "status": p.status}
@@ -86,7 +125,14 @@ class Room:
 
 
 # アプリケーションの初期化時にRoomインスタンスを必要な数だけ作成しておく
-rooms: Dict[str, Room] = {f"room_{i}": Room(f"room_{i}") for i in range(1, 6)}
+ROOM_CONFIG = [
+    ("room_1", PRESETS["std-5-1"]),
+    ("room_2", PRESETS["std-7-1"]),
+    ("room_3", PRESETS["std-11-n"]),
+    ("room_4", PRESETS["half-5-n"]),
+    ("room_5", PRESETS["std-5-1"]),
+]
+rooms = {rid: Room(rid, rule) for rid, rule in ROOM_CONFIG}
 
 class Player:
     def __init__(self, ws: WebSocket):
@@ -193,12 +239,49 @@ def generate_deck() -> List[dict]:
     random.shuffle(deck)
     return deck
 
-def shuffle_and_deal(deck: List[dict]) -> (List[dict], List[dict], List[dict]):
+def build_deck(rule: RulePreset) -> List[dict]:
+    deck = generate_deck()        # 既存関数を流用
+    if rule.deck_rule is DeckRule.EVEN_HALVED:
+        # 偶数 rank (2,4,6,8,10,12) を半分ランダムで除去
+        evens = [c for c in deck if c["rank"] % 2 == 0 and not c["is_joker"]]
+        remove = random.sample(evens, len(evens)//2)
+        deck = [c for c in deck if c not in remove]
     random.shuffle(deck)
-    hand1 = deck[:5]
-    hand2 = deck[5:10]
-    remaining_deck = deck[10:]
-    return hand1, hand2, remaining_deck
+    return deck
+
+def shuffle_and_deal(deck: List[dict], hand_n: int, num_players: int = 2
+                     ) -> Tuple[List[List[dict]], List[dict]]:
+    """
+    deck をシャッフルして num_players 人へ hand_n 枚ずつ順番配り。
+    返り値: hands[プレイヤーごとの手札], remaining_deck
+    """
+    deck = deck[:]            # 破壊的変更を避ける
+    random.shuffle(deck)
+
+    hands = [[] for _ in range(num_players)]
+    total_needed = hand_n * num_players
+    if len(deck) < total_needed:
+        total_needed = len(deck) - (len(deck) % num_players)
+        hand_n = total_needed // num_players  # 足りない場合は配れるだけ配る
+
+    # ラウンドロビンで配る（将来のバグ予防：順番性が必要な場合に備える）
+    for r in range(hand_n):
+        for i in range(num_players):
+            hands[i].append(deck.pop(0))
+    return hands, deck
+
+def push_to_reserve(room: Room, cards: List[dict]) -> None:
+    """出した札を、出した順番のまま予備軍へ積む（重複登録は呼び出し側で避ける）"""
+    if cards:
+        room.reserve.extend(cards)
+
+def flow_field(room: Room) -> None:
+    """場が流れたときの共通処理：場を空にし、予備軍を山札の“下”に戻す（順序保持）"""
+    room.field = []
+    room.last_number = None
+    if room.reserve:
+        room.deck.extend(room.reserve)  # pop(0)で上から引く設計なので、extendは“下に戻す”
+        room.reserve.clear()
 
 ################################################
 # Webhook
@@ -242,7 +325,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             elif msg_type == "get_room_counts":
                 counts = {room_id: len(room.players) for room_id, room in rooms.items()}
-                await websocket.send_json({"type": "room_counts", "counts": counts})
+                rules  = {rid: room.rule.label for rid, room in rooms.items()}
+                await websocket.send_json({"type": "room_counts", "counts": counts, "rules": rules})
 
             elif msg_type == "join_room":
                 rid = data["room_id"]
@@ -272,6 +356,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "change_status":
                 if not player.room:  # 部屋にいなければ無視
                     continue
+                room = player.room
                 new_status = data["status"]
                 player.status = new_status
                 await room.update_room_status()
@@ -309,10 +394,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 # １）ジョーカーだけを単独で出す (グロタンカット相当)
                 jokers = [c for c in played_cards if c["suit"] == "X"]
                 if len(jokers) == 1 and len(played_cards) == 1:
+                    push_to_reserve(room, played_cards)
                     # ジョーカー1枚だけ → 場を流す
                     player.remove_card(jokers[0])
-                    room.field = []
-                    room.last_number = None
+                    # 場を流して予備軍を山へ戻す
+                    flow_field(room)
                     room.has_drawn = False
                     await player.send_hand_update()
                     await room.log_chat(f"{player.name}がジョーカーを出しました、インフィニティ！")
@@ -387,10 +473,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 # グロタンカット
                 if number == 57:
-                    # 場をリセット
+                    # 出した順そのまま予備軍に
+                    push_to_reserve(room, played_cards)
                     for c in played_cards:
                         player.remove_card(c)
-                    room.field = []
+                    # 場を流して予備軍を山へ戻す
+                    flow_field(room)
                     # 自分の手番を継続するため next_turn は呼ばない
                     room.has_drawn = False
                     # クライアントの表示を更新
@@ -405,6 +493,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # フラグをトグル
                     room.reverse_order = not room.reverse_order
                     # カードを場に出す
+                    push_to_reserve(room, played_cards)
                     for c in played_cards:
                         player.remove_card(c)
                     room.field = played_cards
@@ -423,16 +512,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not is_prime(number):
                     # ペナルティ
                     # 出そうとしたカードを引き直すことはしない(そもそも出されていないため)
-                    if room.deck:
-                        drawn = room.deck.pop(0)
-                        player.add_card(drawn)
-
-                    await player.send_hand_update()
+                    penalty_cards = 1 if room.rule.penalty_rule is PenaltyRule.ALWAYS_1 else len(played_cards)
+                    for _ in range(penalty_cards):
+                        if room.deck:
+                            player.add_card(room.deck.pop(0))
 
                     # フィールドをリセット（場のカードを消す）2人対戦想定であることに注意
-                    room.field = []
-                    room.last_number = None
+                    flow_field(room)
 
+                    await player.send_hand_update()
                     await room.update_game_state()
                     await room.broadcast( {
                         "type": "penalty",
@@ -448,6 +536,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 # 素数なら場に出す
+                push_to_reserve(room, played_cards)
                 for c in played_cards:
                     player.remove_card(c)
                 room.field = played_cards
@@ -504,8 +593,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await player.send_hand_update()
 
                 # パスの場合もフィールドをリセット
-                room.field = []
-                room.last_number = None
+                flow_field(room)
 
                 # passの通知
                 await room.update_game_state()
@@ -543,6 +631,7 @@ async def leave_room(player):
     # もしNoneの場合は注意喚起のログも出す
     if player.room is None:
         print("DEBUG: player.room is None; cannot proceed with leave_room processing")
+        return
 
     room_id = player.room.room_id
     if room_id and player in rooms[room_id].players:
@@ -575,42 +664,32 @@ async def leave_room(player):
 async def start_game(room):
     room.reverse_order = False     # 革命向きは通常に戻す
     room.has_drawn = False         # ドロー済みフラグもクリア
-    # 1) デッキを生成＆シャッフル＆配布
-    deck = generate_deck()
-    hand1, hand2, remaining_deck = shuffle_and_deal(deck)
 
-    # 対戦待ちのプレイヤーのみから2人選ぶ
+    # 1) 待機中の2人を確定
     waiting_players = [p for p in room.players if p.status == "waiting"]
-    if len(waiting_players) < 2:
-        # ここは通常、start_gameを呼ぶ前にチェックしているので安全策ですが
+    if len(waiting_players) != 2:
         return
+    p1, p2 = waiting_players
 
-    # 対戦待ちからランダムに2人選択
-    p1, p2 = random.sample(waiting_players, 2)
+    # 2) デッキ生成→配布（プリセット準拠）
+    deck = build_deck(room.rule)
+    hands, remaining = shuffle_and_deal(deck, room.rule.hand_size, num_players=2)
+    p1.hand, p2.hand = hands[0], hands[1]
+    room.deck = remaining
 
-    room.deck = remaining_deck
-    p1.hand = hand1
-    p2.hand = hand2
+    room.reserve = []
     room.field = []  # 場のカードは空
     room.last_number = None
-
     p1.sort_hand()
     p2.sort_hand()
-
     room.state = "playing"
 
     # ランダムに先攻プレイヤー決定
     room.current_turn_id = random.choice([p1.id, p2.id])
 
     # プレイヤーそれぞれに手札情報を送信
-    await p1.ws.send_json({
-        "type": "deal",
-        "your_hand": p1.hand
-    })
-    await p2.ws.send_json({
-        "type": "deal",
-        "your_hand": p2.hand
-    })
+    await p1.ws.send_json({"type": "deal","your_hand": p1.hand})
+    await p2.ws.send_json({"type": "deal","your_hand": p2.hand})
 
     # 全体にゲーム開始 & 現在のターン情報
     await room.broadcast({
