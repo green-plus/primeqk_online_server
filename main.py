@@ -648,15 +648,14 @@ async def leave_room(player):
         await room.log_chat(f"{player.name}が退室しました")
         # ゲーム中の特別処理
         if room.state == "playing":
-            # 現在ターンのプレイヤーが切断した場合、次のターンに進める
-            if room.current_turn_id == player.id:
-                await next_turn(room)
             # 参加プレイヤーが1人だけになったら、ゲーム終了
             if len(room.players) == 1:
                 winner_name = room.players[0].name
                 await room.broadcast({"type": "game_over", "winner": winner_name})
                 await room.log_chat(f"{winner_name}が勝利しました")
                 room.state = "waiting"
+            else if room.current_turn_id == player.id: # 現在ターンのプレイヤーが切断した場合、次のターンに進める
+                await next_turn(room)
 
 
         # 改めて抜けたプレイヤーには各roomの人数を送る機能を追加
