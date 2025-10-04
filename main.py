@@ -654,7 +654,7 @@ async def leave_room(player):
                 await room.broadcast({"type": "game_over", "winner": winner_name})
                 await room.log_chat(f"{winner_name}が勝利しました")
                 room.state = "waiting"
-            else if room.current_turn_id == player.id: # 現在ターンのプレイヤーが切断した場合、次のターンに進める
+            elif room.current_turn_id == player.id: # 現在ターンのプレイヤーが切断した場合、次のターンに進める
                 await next_turn(room)
 
 
