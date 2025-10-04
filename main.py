@@ -130,7 +130,7 @@ ROOM_CONFIG = [
     ("room_2", PRESETS["std-7-1"]),
     ("room_3", PRESETS["std-11-n"]),
     ("room_4", PRESETS["half-5-n"]),
-    ("room_5", PRESETS["std-5-1"]),
+    ("room_5", PRESETS["half-7-1"]),
 ]
 rooms = {rid: Room(rid, rule) for rid, rule in ROOM_CONFIG}
 
@@ -240,12 +240,17 @@ def generate_deck() -> List[dict]:
     return deck
 
 def build_deck(rule: RulePreset) -> List[dict]:
-    deck = generate_deck()        # 既存関数を流用
+    deck = generate_deck()
     if rule.deck_rule is DeckRule.EVEN_HALVED:
-        # 偶数 rank (2,4,6,8,10,12) を半分ランダムで除去
-        evens = [c for c in deck if c["rank"] % 2 == 0 and not c["is_joker"]]
-        remove = random.sample(evens, len(evens)//2)
-        deck = [c for c in deck if c not in remove]
+        # 偶数で、かつスートが D/H のカードだけを除去（Jokerは除外）
+        deck = [
+            c for c in deck
+            if not (
+                (not c["is_joker"]) and
+                (c["rank"] % 2 == 0) and
+                (c["suit"] in ("D", "H"))
+            )
+        ]
     random.shuffle(deck)
     return deck
 
