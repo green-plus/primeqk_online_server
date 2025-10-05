@@ -288,6 +288,12 @@ def flow_field(room: Room) -> None:
         room.deck.extend(room.reserve)  # pop(0)で上から引く設計なので、extendは“下に戻す”
         room.reserve.clear()
 
+def return_cards_to_deck_bottom(room, cards: List[dict]) -> None:
+    """合成数の『消費カード』を即座に山札の底に戻す。場は流さない。"""
+    if not cards:
+        return
+    room.deck.extend(cards)
+
 ################################################
 # Webhook
 ################################################
@@ -387,180 +393,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "message": "あなたのターンではありません。"})
                     continue
 
-                played_cards = data.get("cards", [])
-                # 手札にあるか検証
-                if not player.has_cards(played_cards):
-                    await player.ws.send_json({"type": "error", "message": "そのカードは手札にありません。"})
-                    continue
-
-                # ジョーカー絡みの処理
-                assigned_numbers = data.get("assigned_numbers", [])  # [ "inf" か 0〜13, ... ]
-                # ―――――――――――――――――――
-                # １）ジョーカーだけを単独で出す (グロタンカット相当)
-                jokers = [c for c in played_cards if c["suit"] == "X"]
-                if len(jokers) == 1 and len(played_cards) == 1:
-                    push_to_reserve(room, played_cards)
-                    # ジョーカー1枚だけ → 場を流す
-                    player.remove_card(jokers[0])
-                    # 場を流して予備軍を山へ戻す
-                    flow_field(room)
-                    room.has_drawn = False
-                    await player.send_hand_update()
-                    await room.log_chat(f"{player.name}がジョーカーを出しました、インフィニティ！")
-                    await room.update_game_state()
-                    if await room.try_end_game():
-                        await room.update_room_status()
-                    continue  # ターン継続
-                # ２）ジョーカーを含む複数枚プレイ時は、置換して number を作成
-                if jokers:
-                    if len(assigned_numbers) != len(jokers):
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "ジョーカーの数字指定が不足しています。"
-                        })
-                        continue
-                    if any(v == "inf" for v in assigned_numbers):
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "複数枚出し時に「∞」指定はできません。"
-                        })
-                        continue
-                    ranks = []
-                    joker_i = 0
-                    for c in played_cards:
-                        if c["suit"] == "X":
-                            val = assigned_numbers[joker_i]
-                            joker_i += 1
-                            ranks.append(str(val))
-                        else:
-                            ranks.append(str(c["rank"]))
-                    ranks_str = "".join(ranks)
-
-                    # 先頭が 0 の数字は許可しない
-                    if ranks_str.startswith("0"):
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "最上位桁が0の数字は出せません。"
-                        })
-                        continue
-
-                    try:
-                        number = int(ranks_str)
-                    except ValueError:
-                        number = -1
-                else:
-                    # 通常カードのみ
-                    ranks_str = "".join(str(c["rank"]) for c in played_cards)
-                    try:
-                        number = int(ranks_str)
-                    except ValueError:
-                        number = -1
-
-                # もしフィールドに既にカードが出ているなら、枚数と数の検証を行う
-                if room.field:
-                    # ① 枚数チェック
-                    if len(played_cards) != len(room.field):
-                        await websocket.send_json({"type": "error", "message": "枚数が違います。"})
-                        continue
-
-                    # ② 数値チェック：フィールドのカードと比較
-                    field_number = room.last_number if room.last_number is not None else -1
-
-                    # 通常は「>」が必要、反転中は「<」を要求
-                    if not room.reverse_order:
-                        if number <= field_number:
-                            await websocket.send_json({"type": "error", "message": "場より大きい数字を出してください。"})
-                            continue
+                # モードごとに対応する関数を実行
+                mode = (data.get("mode") or "prime").lower()
+                try:
+                    if mode == "composite":
+                        await handle_composite_play(player, room, data)
                     else:
-                        if number >= field_number:
-                            await websocket.send_json({"type": "error", "message": "場より小さい数字を出してください。(ラマヌジャン革命中)"})
-                            continue
+                        await handle_prime_play(player, room, data)
+                except CompositeError as e:
+                    await websocket.send_json({"type":"error","message":e.msg})
 
-                # グロタンカット
-                if number == 57:
-                    # 出した順そのまま予備軍に
-                    push_to_reserve(room, played_cards)
-                    for c in played_cards:
-                        player.remove_card(c)
-                    # 場を流して予備軍を山へ戻す
-                    flow_field(room)
-                    # 自分の手番を継続するため next_turn は呼ばない
-                    room.has_drawn = False
-                    # クライアントの表示を更新
-                    await player.send_hand_update()
-                    await room.log_chat(f"{player.name}が57を出しました、グロタンカット！")
-                    await room.update_game_state()
-                    if await room.try_end_game():
-                        await room.update_room_status()
-                        continue
-                    continue  # 次の処理（素数判定～next_turn）をすべてスキップ
-                if number == 1729:
-                    # フラグをトグル
-                    room.reverse_order = not room.reverse_order
-                    # カードを場に出す
-                    push_to_reserve(room, played_cards)
-                    for c in played_cards:
-                        player.remove_card(c)
-                    room.field = played_cards
-                    room.last_number = number
 
-                    # 手札更新 & ゲーム状態通知
-                    await player.send_hand_update()
-                    await room.update_game_state()
-                    # ログ
-                    await room.log_chat(f"{player.name}が1729を出しました、ラマヌジャン革命！")
-
-                    # 通常の素数出しと同じく次のターンへ
-                    await next_turn(room)
-                    continue
-                # 素数判定
-                if not is_prime(number):
-                    # ペナルティ
-                    # 出そうとしたカードを引き直すことはしない(そもそも出されていないため)
-                    penalty_cards = 1 if room.rule.penalty_rule is PenaltyRule.ALWAYS_1 else len(played_cards)
-                    for _ in range(penalty_cards):
-                        if room.deck:
-                            player.add_card(room.deck.pop(0))
-
-                    # フィールドをリセット（場のカードを消す）2人対戦想定であることに注意
-                    flow_field(room)
-
-                    await player.send_hand_update()
-                    await room.update_game_state()
-                    await room.broadcast( {
-                        "type": "penalty",
-                        "player_id": player.id,
-                        "played_cards": played_cards,
-                        "number": number
-                    })
-
-                    # チャットにペナルティのログを流す
-                    await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は素数ではありません")
-
-                    await next_turn(room)
-                    continue
-
-                # 素数なら場に出す
-                push_to_reserve(room, played_cards)
-                for c in played_cards:
-                    player.remove_card(c)
-                room.field = played_cards
-                room.last_number = number
-
-                await player.send_hand_update()
-
-                await room.update_game_state()
-                await room.broadcast({
-                    "type": "action_result",
-                    "action": "play_card",
-                    "player_id": player.id,
-                    "played_cards": played_cards,
-                    "number": number
-                })
-
-                # チャットに「素数を出した」ログを流す
-                await room.log_chat(f"{player.name}が{number}を出しました")
-                await next_turn(room)
 
             elif msg_type == "draw_card":
                 if not player.room:
@@ -625,6 +468,474 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         await leave_room(player)
+
+################################################
+# カードプレイ時の判定
+################################################
+async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
+    # 既存の "cards" + "assigned_numbers" で連結 → 特別数(57,1729) → 素数チェック
+    played_cards = data.get("cards", [])
+    # 手札にあるか検証
+    if not player.has_cards(played_cards):
+        await player.ws.send_json({"type": "error", "message": "そのカードは手札にありません。"})
+        return
+
+    # ジョーカー絡みの処理
+    assigned_numbers = data.get("assigned_numbers", [])  # [ "inf" か 0〜13, ... ]
+    # ―――――――――――――――――――
+    # １）ジョーカーだけを単独で出す (グロタンカット相当)
+    jokers = [c for c in played_cards if c["suit"] == "X"]
+    if len(jokers) == 1 and len(played_cards) == 1:
+        push_to_reserve(room, played_cards)
+        # ジョーカー1枚だけ → 場を流す
+        player.remove_card(jokers[0])
+        # 場を流して予備軍を山へ戻す
+        flow_field(room)
+        room.has_drawn = False
+        await player.send_hand_update()
+        await room.log_chat(f"{player.name}がジョーカーを出しました、インフィニティ！")
+        await room.update_game_state()
+        if await room.try_end_game():
+            await room.update_room_status()
+        return  # ターン継続
+    # ２）ジョーカーを含む複数枚プレイ時は、置換して number を作成
+    if jokers:
+        if len(assigned_numbers) != len(jokers):
+            await websocket.send_json({
+                "type": "error",
+                "message": "ジョーカーの数字指定が不足しています。"
+            })
+            return
+        if any(v == "inf" for v in assigned_numbers):
+            await websocket.send_json({
+                "type": "error",
+                "message": "複数枚出し時に「∞」指定はできません。"
+            })
+            return
+        ranks = []
+        joker_i = 0
+        for c in played_cards:
+            if c["suit"] == "X":
+                val = assigned_numbers[joker_i]
+                joker_i += 1
+                ranks.append(str(val))
+            else:
+                ranks.append(str(c["rank"]))
+        ranks_str = "".join(ranks)
+
+        # 先頭が 0 の数字は許可しない
+        if ranks_str.startswith("0"):
+            await websocket.send_json({
+                "type": "error",
+                "message": "最上位桁が0の数字は出せません。"
+            })
+            return
+
+        try:
+            number = int(ranks_str)
+        except ValueError:
+            number = -1
+    else:
+        # 通常カードのみ
+        ranks_str = "".join(str(c["rank"]) for c in played_cards)
+        try:
+            number = int(ranks_str)
+        except ValueError:
+            number = -1
+
+    # もしフィールドに既にカードが出ているなら、枚数と数の検証を行う
+    if room.field:
+        # ① 枚数チェック
+        if len(played_cards) != len(room.field):
+            await websocket.send_json({"type": "error", "message": "枚数が違います。"})
+            return
+
+        # ② 数値チェック：フィールドのカードと比較
+        field_number = room.last_number if room.last_number is not None else -1
+
+        # 通常は「>」が必要、反転中は「<」を要求
+        if not room.reverse_order:
+            if number <= field_number:
+                await websocket.send_json({"type": "error", "message": "場より大きい数字を出してください。"})
+                return
+        else:
+            if number >= field_number:
+                await websocket.send_json({"type": "error", "message": "場より小さい数字を出してください。(ラマヌジャン革命中)"})
+                return
+
+    # グロタンカット
+    if number == 57:
+        # 出した順そのまま予備軍に
+        push_to_reserve(room, played_cards)
+        for c in played_cards:
+            player.remove_card(c)
+        # 場を流して予備軍を山へ戻す
+        flow_field(room)
+        # 自分の手番を継続するため next_turn は呼ばない
+        room.has_drawn = False
+        # クライアントの表示を更新
+        await player.send_hand_update()
+        await room.log_chat(f"{player.name}が57を出しました、グロタンカット！")
+        await room.update_game_state()
+        if await room.try_end_game():
+            await room.update_room_status()
+            return
+        return  # 次の処理（素数判定～next_turn）をすべてスキップ
+    if number == 1729:
+        # フラグをトグル
+        room.reverse_order = not room.reverse_order
+        # カードを場に出す
+        push_to_reserve(room, played_cards)
+        for c in played_cards:
+            player.remove_card(c)
+        room.field = played_cards
+        room.last_number = number
+
+        # 手札更新 & ゲーム状態通知
+        await player.send_hand_update()
+        await room.update_game_state()
+        # ログ
+        await room.log_chat(f"{player.name}が1729を出しました、ラマヌジャン革命！")
+
+        # 通常の素数出しと同じく次のターンへ
+        await next_turn(room)
+        return
+    # 素数判定
+    if not is_prime(number):
+        # ペナルティ
+        # 出そうとしたカードを引き直すことはしない(そもそも出されていないため)
+        penalty_cards = 1 if room.rule.penalty_rule is PenaltyRule.ALWAYS_1 else len(played_cards)
+        for _ in range(penalty_cards):
+            if room.deck:
+                player.add_card(room.deck.pop(0))
+
+        # フィールドをリセット（場のカードを消す）2人対戦想定であることに注意
+        flow_field(room)
+
+        await player.send_hand_update()
+        await room.update_game_state()
+        await room.broadcast( {
+            "type": "penalty",
+            "player_id": player.id,
+            "played_cards": played_cards,
+            "number": number
+        })
+
+        # チャットにペナルティのログを流す
+        await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は素数ではありません")
+
+        await next_turn(room)
+        return
+
+    # 素数なら場に出す
+    push_to_reserve(room, played_cards)
+    for c in played_cards:
+        player.remove_card(c)
+    room.field = played_cards
+    room.last_number = number
+
+    await player.send_hand_update()
+
+    await room.update_game_state()
+    await room.broadcast({
+        "type": "action_result",
+        "action": "play_card",
+        "player_id": player.id,
+        "played_cards": played_cards,
+        "number": number
+    })
+
+    # チャットに「素数を出した」ログを流す
+    await room.log_chat(f"{player.name}が{number}を出しました")
+    await next_turn(room)
+
+MAX_EXP = 12  # 安全ガード
+
+# エラーメッセージ & 分類
+class CompositeError(Exception):
+    def __init__(self, msg: str):
+        self.msg = msg
+        super().__init__(msg)
+# 文法エラー（やり直し）
+class CompositeSyntaxError(CompositeError):
+    pass
+
+# 計算誤り（ペナルティ）
+class CompositeMathError(CompositeError):
+    pass
+
+def map_joker_values_in_cards(cards: List[dict], assigned: List[str], allow_inf_singleton: bool) -> List[int]:
+    """
+    cards の並びを整数列(ランク)にする。Jokerは assigned で置換。
+    allow_inf_singleton が True のときのみ、Joker1枚・単独・"inf" を許す（場流し扱いへ）。
+    """
+    jokers = [c for c in cards if c["suit"] == "X"]
+    if len(jokers) != len(assigned):
+        raise CompositeError("ジョーカーの数字指定が不足しています。")
+
+    # 単独 Joker ∧ allow_inf_singleton のみ "inf" を許す
+    if any(v == "inf" for v in assigned):
+        if not (allow_inf_singleton and len(cards) == 1 and len(jokers) == 1):
+            raise CompositeError("この状況で∞は使用できません。")
+
+    out = []
+    ji = 0
+    for c in cards:
+        if c["suit"] == "X":
+            v = assigned[ji]
+            ji += 1
+            if v == "inf":
+                out.append("inf")  # 単独流しだけこのまま返す
+            else:
+                out.append(int(v))
+        else:
+            out.append(c["rank"])
+    return out
+
+def build_int_from_cards(seq: List[int]) -> int:
+    s = "".join(str(x) for x in seq)
+    if s.startswith("0"):
+        raise CompositeError("最上位桁が0の数は作れません。")
+    return int(s)
+
+def parse_and_eval_composite(tokens: List[dict],
+                             token_card_ranks: Dict[str,int],
+                             joker_values: List[int]) -> Tuple[int, List[str]]:
+    """
+    tokens: [{kind:'card', card_id:...} | {kind:'op', op:'×'|'^'}]
+    token_card_ranks: card_id -> ランク（Jokerは割当後）
+    joker_values: （未使用、説明簡略化）
+    return: (value, used_card_ids)
+    """
+    # 1) 構文検査：card/op の交互、先頭末尾が card
+    if not tokens:
+        raise CompositeSyntaxError("合成数の式が空です。")
+    if tokens[0]["kind"] != "card" or tokens[-1]["kind"] != "card":
+        raise CompositeSyntaxError("式の先頭と末尾はカードである必要があります。")
+    for i in range(1, len(tokens)-1):
+        if tokens[i]["kind"] == tokens[i+1]["kind"]:
+            raise CompositeSyntaxError("カードと演算子は交互に並べてください。")
+
+    # 2) “×” で分割 → 各チャンクは「pow 連鎖」: base ^ exp ^ exp ...
+    chunks: List[List[dict]] = []
+    cur = []
+    for t in tokens:
+        if t["kind"] == "op" and t["op"] == "×":
+            if not cur: raise CompositeSyntaxError("× の前後が不正です。")
+            chunks.append(cur); cur = []
+        else:
+            cur.append(t)
+    chunks.append(cur)
+
+    used_card_ids: List[str] = []
+    total_value = 1
+
+    for ch in chunks:
+        # ch は card (^ card (^ card ...)) の列（右結合）
+        # まず ch から連続する card のかたまりを抽出し、その間にある ^ を確認
+        # 例: [card, op(^), card, op(^), card]
+        # → baseSeq = [第1かたまり]; exps = [第2かたまり, 第3かたまり, ...]
+        seqs: List[List[int]] = []  # 各かたまり（連続card）の連結値を作る元
+        temp_cards: List[str] = []
+
+        cur_cards: List[int] = []
+        cur_ids:   List[str] = []
+
+        expect_card = True
+        for t in ch:
+            if expect_card:
+                if t["kind"] != "card": raise CompositeSyntaxError("^ の使い方が不正です。")
+                cid = t["card_id"]
+                if cid not in token_card_ranks: raise CompositeSyntaxError("未知のカードが指定されました。")
+                cur_cards.append(token_card_ranks[cid])
+                cur_ids.append(cid)
+                expect_card = False
+            else:
+                if t["kind"] == "card":
+                    # 連続する card → 同じ“かたまり”に結合
+                    cid = t["card_id"]
+                    if cid not in token_card_ranks: raise CompositeSyntaxError("未知のカードが指定されました。")
+                    cur_cards.append(token_card_ranks[cid])
+                    cur_ids.append(cid)
+                else:
+                    # op
+                    if t["op"] not in ("^",): raise CompositeSyntaxError("× は分割済みのはずです。")
+                    # かたまり終了
+                    if not cur_cards: raise CompositeSyntaxError("演算子の並びが不正です。")
+                    seqs.append(cur_cards)
+                    temp_cards.extend(cur_ids)
+                    # 次は card のかたまり開始を期待
+                    cur_cards, cur_ids = [], []
+                    expect_card = True
+
+        # 末尾のかたまり
+        if not cur_cards: raise CompositeSyntaxError("式の末尾が不正です。")
+        seqs.append(cur_cards)
+        temp_cards.extend(cur_ids)
+
+        # 右結合評価：a ^ b ^ c ＝ a ^ (b ^ c)
+        # 1) かたまりを整数化（先頭0禁止）
+        ints = [build_int_from_cards(s) for s in seqs]
+        # 2) 制約: 底は素数
+        base = ints[0]
+        if base < 2:
+            raise CompositeSyntaxError("底が1桁0/1は不可です。")
+        if not is_prime(base):
+            raise CompositeMathError(f"底 {base} が素数ではありません。")
+        # 3) 指数連鎖の評価（右から）
+        exp = 1
+        for e in reversed(ints[1:]):
+            if e > MAX_EXP:
+                raise CompositeMathError(f"指数 {e} が上限 {MAX_EXP} を超えています。")
+            exp = pow(e, exp)  # 右結合
+            if exp > MAX_EXP:
+                raise CompositeMathError(f"合成された指数 {exp} が上限 {MAX_EXP} を超えています。")
+
+        value = pow(base, exp)
+        total_value *= value
+        used_card_ids.extend(temp_cards)
+
+    return total_value, used_card_ids
+
+async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
+    # 0) 手番 & 手札 所有チェック（共通）
+    selected = data.get("selected", {}) or {}
+    consume  = data.get("consume", {}) or {}
+    comp     = data.get("composite", {}) or {}
+    sel_cards: List[dict] = selected.get("cards", [])
+    con_cards: List[dict] = consume.get("cards", [])
+    comp_tokens: List[dict] = comp.get("tokens", [])
+    sel_assigned: List[str] = selected.get("assigned_numbers", [])
+    comp_assigned: List[str] = comp.get("assigned_numbers", [])
+
+    # 手札に全部あるか
+    all_consume = list({c["card_id"]:c for c in (sel_cards + con_cards)}.values())
+    if not player.has_cards(all_consume):
+        await player.ws.send_json({"type": "error", "message": "そのカードは手札にありません。"})
+        return
+
+    # 1) Joker 検証（選択側）: 合成数モードでは∞は常に禁止（単独流しも不可）
+    try:
+        # 値の割当チェックのみ行い、∞は許可しない
+        map_joker_values_in_cards(sel_cards, sel_assigned, allow_inf_singleton=False)
+    except CompositeError as e:
+        await player.ws.send_json({"type":"error","message":e.msg});
+        return
+
+    # 2) 合成数場 Joker 割当
+    #   comp_tokens 上に Joker が m 枚出現していることを数え、その m と comp_assigned の長さが一致、かつ inf を含まないことを要求
+    comp_joker_count = 0
+    card_by_id = { c["card_id"]: c for c in player.hand }
+    for t in comp_tokens:
+        if t.get("kind") == "card":
+            c = card_by_id.get(t["card_id"])
+            if c and c.get("is_joker"): comp_joker_count += 1
+    if comp_joker_count != len(comp_assigned) or any(v=="inf" for v in comp_assigned):
+        await player.ws.send_json({"type":"error","message":"合成数内のジョーカー指定が不正です。"})
+        return
+
+    # 3) token_card_ranks を作る（合成数トークンの “card_id → ランク”）
+    #    Joker は comp_assigned を登場順に置換
+    token_card_ranks: Dict[str,int] = {}
+    jidx = 0
+    for t in comp_tokens:
+        if t.get("kind") == "card":
+            cid = t["card_id"]
+            c   = card_by_id.get(cid)
+            if not c:
+                await player.ws.send_json({"type":"error","message":"未知のカードが式に含まれています。"}); return
+            if c.get("is_joker"):
+                token_card_ranks[cid] = int(comp_assigned[jidx]); jidx += 1
+            else:
+                token_card_ranks[cid] = int(c["rank"])
+
+    # 4) 早期チェック：枚数・大小は selected のみで判定（合成数のパース前）
+    # 4-1) 枚数（場があるときは selected の枚数と一致必須）
+    if room.field:
+        if len(sel_cards) != len(room.field):
+            await player.ws.send_json({"type":"error","message":"枚数が違います。"})
+            return
+
+    # 4-2) 大小（selected を連結して得た sel_number で比較）
+    #      ※ 合成数モードでは ∞ 不可／先頭0不可
+    try:
+        sel_ranks = map_joker_values_in_cards(sel_cards, sel_assigned, allow_inf_singleton=False)
+    except CompositeError as e:
+        await player.ws.send_json({"type":"error","message":e.msg})
+        return
+
+    sel_str = "".join(str(x) for x in sel_ranks)
+    if sel_str.startswith("0"):
+        await player.ws.send_json({"type":"error","message":"最上位桁が0の数字は出せません。"})
+        return
+    sel_number = int(sel_str) if sel_str else -1
+
+    if room.field:
+        field_number = room.last_number if room.last_number is not None else -1
+        if (not room.reverse_order and sel_number <= field_number) or (room.reverse_order and sel_number >= field_number):
+            await player.ws.send_json({
+                "type":"error",
+                "message": ("場より大きい数字を出してください。" if not room.reverse_order else "場より小さい数字を出してください。(ラマヌジャン革命中)")
+            })
+            return
+
+    # 5) 合成数の構文・評価（con 側）。構文はエラー返し、計算はペナルティ。
+    try:
+        number, used_ids = parse_and_eval_composite(comp_tokens, token_card_ranks, [])
+        # con を全て掛け合わせた number と sel_number は一致必須（不一致は MathError → ペナルティ）
+        if number != sel_number:
+            raise CompositeMathError("選択カードの数と合成数の値が一致しません。")
+    except CompositeSyntaxError as e:
+        await player.ws.send_json({"type":"error","message":e.msg})
+        return
+    except CompositeMathError as e:
+        penalty_cards = 1 if room.rule.penalty_rule is PenaltyRule.ALWAYS_1 else len(sel_cards)
+        for _ in range(penalty_cards):
+            if room.deck:
+                player.add_card(room.deck.pop(0))
+        flow_field(room)
+        await player.send_hand_update()
+        await room.update_game_state()
+        await room.broadcast({
+            "type": "penalty",
+            "player_id": player.id,
+            "played_cards": sel_cards,
+            "number": sel_number
+        })
+        await room.log_chat(f"{player.name}の合成数は不正でした（{e.msg}）。ペナルティ。")
+        await next_turn(room)
+        return
+
+    # 7) すべてOK → 札を「出した順」でreserveに積む → 手札から除去
+    #    出した順は UI から渡す順序（selected→consume）で良ければそのまま。必要なら tokens から順序を決める。
+    push_to_reserve(room, sel_cards)
+
+    # selected と重複するカードは deck に戻さない
+    sel_ids = {c["card_id"] for c in sel_cards}
+    con_only = [c for c in con_cards if c["card_id"] not in sel_ids]
+    return_cards_to_deck_bottom(room, con_only)
+
+    # 手札からは selected/consume 全部を除去（all_consume はユニーク化済み想定）
+    for c in all_consume:
+        player.remove_card(c)
+
+    # field には sel 側が残る仕様。大小・一致は sel_number 基準。
+    room.field = sel_cards # 合成数は流すのでカウントされない
+    room.last_number = sel_number
+
+    await player.send_hand_update()
+    await room.update_game_state()
+    await room.broadcast({
+        "type":"action_result",
+        "action":"play_card",
+        "player_id": player.id,
+        "played_cards": room.field,
+        "number": sel_number,
+        "mode": "composite"
+    })
+    await room.log_chat(f"{player.name}が合成数 {sel_number} を出しました")
+    await next_turn(room)
+
 
 ################################################
 # 部屋からの退出
