@@ -403,7 +403,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await room.log_chat(f"{player.name}が入室しました")
                 # 同期処理の後で、バックグラウンドに通知タスクを投げる
                 asyncio.create_task(
-                    notify_discord(f"🎮 {player.name} が {room.room_id} に参加しました")
+                    notify_discord(f"🎮 {player.name} が {room.room_id}（{room.rule.label}）に参加しました")
                 )
 
 
