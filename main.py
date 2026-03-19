@@ -167,8 +167,9 @@ ROOM_CONFIG = [
     ("room_5", PRESETS["half-7-1"]),
     ("room_6", PRESETS["std-11-f-c"]),
     ("room_7", PRESETS["std-11-n-c"]),
-    ("room_8", PRESETS["tetrad-11-n"]),
-    ("room_9", PRESETS["tetrad-11-n-c"]),
+    ("room_8", PRESETS["std-11-n-c-rev"]),
+    ("room_9", PRESETS["tetrad-11-n"]),
+    ("room_10", PRESETS["tetrad-11-n-c"]),
 ]
 rooms = {rid: Room(rid, rule) for rid, rule in ROOM_CONFIG}
 
@@ -1081,7 +1082,7 @@ async def leave_room(player):
 # ゲーム開始処理
 ################################################
 async def start_game(room):
-    room.reverse_order = False     # 革命向きは通常に戻す
+    room.reverse_order = room.rule.start_revolution     # 革命はルールごとの開始時コンディションに戻す
     room.has_drawn = False         # ドロー済みフラグもクリア
 
     # 1) 待機中の2人を確定

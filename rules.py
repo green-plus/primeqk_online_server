@@ -25,6 +25,7 @@ class RulePreset:
     hand_size: int
     penalty_rule: PenaltyRule
     allow_composite: bool = False
+    start_revolution: bool = False
     prime_rule: PrimeRule = PrimeRule.NORMAL
 
 PRESETS: Dict[str, RulePreset] = {
@@ -67,6 +68,15 @@ PRESETS: Dict[str, RulePreset] = {
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
         allow_composite=True,
+    ),
+    "std-11-n-c-rev": RulePreset(
+        key="std-11-n-c-rev",
+        label="標準: 11枚 / 通常 / 合成数あり / 初期革命",
+        deck_rule=DeckRule.DEFAULT,
+        hand_size=11,
+        penalty_rule=PenaltyRule.NORMAL,
+        allow_composite=True,
+        start_revolution=True,
     ),
     "half-5-f": RulePreset(
         key="half-5-f",
