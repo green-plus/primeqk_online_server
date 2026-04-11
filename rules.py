@@ -14,8 +14,9 @@ class PenaltyRule(Enum):
     NORMAL = auto()        # 通常（合成数では材料札も含む）
 
 class PrimeRule(Enum):
-    NORMAL = auto()      # 通常の素数
-    TETRAD = auto()      # 四つ子素数
+    NORMAL = auto()       # 通常の素数
+    TETRAD = auto()       # 四つ子素数
+    SEMIPRIME = auto()    # 半素数
 
 @dataclass(frozen=True)
 class RulePreset:
@@ -95,7 +96,7 @@ PRESETS: Dict[str, RulePreset] = {
         allow_composite=True,
     ),
     "tetrad-11-n": RulePreset(
-        key="tetrad-11-f",
+        key="tetrad-11-n",
         label="四つ子素数: 11枚 / 通常",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
@@ -104,12 +105,30 @@ PRESETS: Dict[str, RulePreset] = {
         prime_rule=PrimeRule.TETRAD,
     ),
     "tetrad-11-n-c": RulePreset(
-        key="tetrad-11-f-c",
+        key="tetrad-11-n-c",
         label="四つ子素数: 11枚 / 通常 / 合成数あり",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
         allow_composite=True,
         prime_rule=PrimeRule.TETRAD,
+    ),
+    "semiprime-11-n": RulePreset(
+        key="semiprime-11-n",
+        label="半素数: 11枚 / 通常",
+        deck_rule=DeckRule.DEFAULT,
+        hand_size=11,
+        penalty_rule=PenaltyRule.NORMAL,
+        allow_composite=False,
+        prime_rule=PrimeRule.SEMIPRIME,
+    ),
+    "semiprime-11-n-c": RulePreset(
+        key="semiprime-11-n-c",
+        label="半素数: 11枚 / 通常 / 合成数あり",
+        deck_rule=DeckRule.DEFAULT,
+        hand_size=11,
+        penalty_rule=PenaltyRule.NORMAL,
+        allow_composite=True,
+        prime_rule=PrimeRule.SEMIPRIME,
     ),
 }

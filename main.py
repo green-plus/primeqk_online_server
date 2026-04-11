@@ -7,6 +7,7 @@ import secrets
 import uuid
 import asyncio
 import os, httpx
+from math import gcd
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 app = FastAPI()
@@ -82,12 +83,107 @@ def is_twin_quadruplet_prime(n: int) -> bool:
 
     return False
 
+def find_prime_factor(n: int) -> int:
+    """
+    n の素因数を1つ返す。
+    n が素数なら n 自身を返してもよい想定だが、
+    呼び出し側では基本的に合成数に対して使う。
+    """
+    if n % 2 == 0:
+        return 2
+    if n % 3 == 0:
+        return 3
+    if is_prime(n):
+        return n
+
+    m = int(n ** 0.125) + 1
+
+    for c in range(1, 100):   # 無限に回さず適度に打ち切る
+        f = lambda a: (pow(a, 2, n) + c) % n
+        y = 2
+        g = q = 1
+        r = 1
+        ys = 0
+
+        while g == 1:
+            x = y
+            k = 0
+
+            while k < r:
+                ys = y
+                upper = min(m, r - k)
+                for _ in range(upper):
+                    y = f(y)
+                    q = (q * abs(x - y)) % n
+                g = gcd(q, n)
+                k += m
+
+                if g > 1:
+                    break
+
+            r *= 2
+
+        if g == n:
+            g = 1
+            y = ys
+            while g == 1:
+                y = f(y)
+                g = gcd(abs(x - y), n)
+
+        if 1 < g < n:
+            if is_prime(g):
+                return g
+            return find_prime_factor(g)
+
+    # うまく見つからなかったときの保険
+    # 小さい奇数で試し割り
+    d = 5
+    while d * d <= n and d < 100000:
+        if n % d == 0:
+            return d
+        d += 2
+
+    return n
+
+def is_semiprime(n: int) -> bool:
+    """
+    半素数判定。
+    素数2個の積なら True。
+    例: 6=2*3, 9=3*3, 15=3*5 は True
+        2, 3, 5, 8, 12 などは False
+    """
+    if n < 4:
+        return False
+
+    # 素数そのものは半素数ではない
+    if is_prime(n):
+        return False
+
+    p = find_prime_factor(n)
+    if p <= 1 or p == n:
+        return False
+
+    q, r = divmod(n, p)
+    if r != 0:
+        return False
+
+    return is_prime(p) and is_prime(q)
+
 def is_valid_prime_by_rule(n: int, rule: RulePreset) -> bool:
     if rule.prime_rule is PrimeRule.NORMAL:
         return is_prime(n)
     if rule.prime_rule is PrimeRule.TETRAD:
         return is_twin_quadruplet_prime(n)
+    if rule.prime_rule is PrimeRule.SEMIPRIME:
+        return is_semiprime(n)
     return is_prime(n)
+
+def rule_display_name(prime_rule: PrimeRule) -> str:
+    if prime_rule is PrimeRule.TETRAD:
+        return "四つ子素数"
+    if prime_rule is PrimeRule.SEMIPRIME:
+        return "半素数"
+    return "素数"
 
 ################################################
 # クラス定義
@@ -170,6 +266,8 @@ ROOM_CONFIG = [
     ("room_8", PRESETS["std-11-n-c-rev"]),
     ("room_9", PRESETS["tetrad-11-n"]),
     ("room_10", PRESETS["tetrad-11-n-c"]),
+    ("room_11", PRESETS["semiprime-11-n"]),
+    ("room_12", PRESETS["semiprime-11-n-c"]),
 ]
 rooms = {rid: Room(rid, rule) for rid, rule in ROOM_CONFIG}
 
@@ -683,7 +781,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         })
 
         # チャットにペナルティのログを流す
-        rule_name = "四つ子素数" if room.rule.prime_rule is PrimeRule.TETRAD else "素数"
+        rule_name = rule_display_name(room.rule.prime_rule)
         await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は{rule_name}ではありません")
 
         await next_turn(room)
@@ -866,7 +964,7 @@ def parse_and_eval_composite(
         if base < 2:
             raise CompositeSyntaxError("底が0または1は不可です。")
         if not is_valid_prime_by_rule(base, rule):
-            kind = "四つ子素数" if rule.prime_rule is PrimeRule.TETRAD else "素数"
+            kind = rule_display_name(rule.prime_rule)
             raise CompositeMathError(f"底 {base} が{kind}ではありません。")
 
         # 6) 指数連鎖を右結合で評価
