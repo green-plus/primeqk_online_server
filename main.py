@@ -8,6 +8,7 @@ import uuid
 import asyncio
 import os, httpx
 from math import gcd
+import time
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 app = FastAPI()
@@ -83,12 +84,15 @@ def is_twin_quadruplet_prime(n: int) -> bool:
 
     return False
 
-def find_prime_factor(n: int) -> int:
+def find_prime_factor(n: int, time_limit: float = 2.0) -> int:
     """
-    n の素因数を1つ返す。
-    n が素数なら n 自身を返してもよい想定だが、
-    呼び出し側では基本的に合成数に対して使う。
+    Pollard Rho + 最後の保険の試し割りで n の素因数を1つ返す。
+    - できるだけ最後まで粘る
+    - ただし安全のため time_limit 秒で打ち切る
+    - n が素数なら n 自身を返す
     """
+    start_time = time.perf_counter()
+
     if n % 2 == 0:
         return 2
     if n % 3 == 0:
@@ -96,70 +100,79 @@ def find_prime_factor(n: int) -> int:
     if is_prime(n):
         return n
 
-    m = int(n ** 0.125) + 1
+    def timed_out() -> bool:
+        return (time.perf_counter() - start_time) >= time_limit
 
-    for c in range(1, 100):   # 無限に回さず適度に打ち切る
-        f = lambda a: (pow(a, 2, n) + c) % n
+    m = int(n ** 0.125) + 1
+    c = 1
+
+    while not timed_out():
+        f = lambda a, c=c: (pow(a, 2, n) + c) % n
         y = 2
         g = q = 1
         r = 1
         ys = 0
 
-        while g == 1:
+        while g == 1 and not timed_out():
             x = y
             k = 0
+            q = 1
 
-            while k < r:
+            while k < r and g == 1 and not timed_out():
                 ys = y
                 upper = min(m, r - k)
                 for _ in range(upper):
                     y = f(y)
                     q = (q * abs(x - y)) % n
                 g = gcd(q, n)
-                k += m
-
-                if g > 1:
-                    break
+                k += upper
 
             r *= 2
+
+        if timed_out():
+            break
 
         if g == n:
             g = 1
             y = ys
-            while g == 1:
+            while g == 1 and not timed_out():
                 y = f(y)
                 g = gcd(abs(x - y), n)
+
+        if timed_out():
+            break
 
         if 1 < g < n:
             if is_prime(g):
                 return g
-            return find_prime_factor(g)
+            return find_prime_factor(g, time_limit=max(0.1, time_limit - (time.perf_counter() - start_time)))
 
-    # うまく見つからなかったときの保険
-    # 小さい奇数で試し割り
+        c += 1
+
+    # ---- 保険: 時間が残っていれば試し割り ----
     d = 5
-    while d * d <= n and d < 100000:
+    while d * d <= n and not timed_out():
         if n % d == 0:
             return d
-        d += 2
+        if n % (d + 2) == 0:
+            return d + 2
+        d += 6
 
+    # 見つからなければ n を返す
     return n
 
 def is_semiprime(n: int) -> bool:
     """
     半素数判定。
-    素数2個の積なら True。
-    例: 6=2*3, 9=3*3, 15=3*5 は True
-        2, 3, 5, 8, 12 などは False
+    素数2個の積なら True（平方も可）。
     """
     if n < 4:
         return False
 
-    # 素数そのものは半素数ではない
     if is_prime(n):
         return False
 
-    p = find_prime_factor(n)
+    p = find_prime_factor(n, time_limit=2.0)
     if p <= 1 or p == n:
         return False
 
@@ -175,6 +188,8 @@ def is_valid_prime_by_rule(n: int, rule: RulePreset) -> bool:
     if rule.prime_rule is PrimeRule.TETRAD:
         return is_twin_quadruplet_prime(n)
     if rule.prime_rule is PrimeRule.SEMIPRIME:
+        if n >= 10**24:
+            return False
         return is_semiprime(n)
     return is_prime(n)
 
