@@ -87,7 +87,7 @@ PRESETS: Dict[str, RulePreset] = {
         penalty_rule=PenaltyRule.FIELD_COUNT,
         allow_composite=False,
     ),
-    "half-7-1": RulePreset(
+    "half-7-1-c": RulePreset(
         key="half-7-1-c",
         label="偶数半減: 7枚 / ペナ1 / 合成数あり",
         deck_rule=DeckRule.EVEN_HALVED,
