@@ -88,7 +88,7 @@ PRESETS: Dict[str, RulePreset] = {
         allow_composite=False,
     ),
     "half-7-1": RulePreset(
-        key="half-7-1",
+        key="half-7-1-c",
         label="偶数半減: 7枚 / ペナ1 / 合成数あり",
         deck_rule=DeckRule.EVEN_HALVED,
         hand_size=7,
