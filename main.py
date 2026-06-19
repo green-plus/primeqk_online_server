@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule
 import random
 from random import randrange
@@ -217,6 +217,7 @@ class Room:
         self.current_turn_id = None
         self.has_drawn = False
         self.reverse_order = False
+        self.score_log = []
 
     async def broadcast(self, message: dict):
         for p in self.players:
@@ -254,7 +255,10 @@ class Room:
             "deck_count": len(self.deck),
             "field": self.field,
             "player_list": [{"id": p.id, "name": p.name, "status": p.status} for p in self.players],
-            "hand_counts": [{"id": p.id, "name": p.name, "count": len(p.hand)} for p in self.players]
+            "hand_counts": [
+                {"id": p.id, "name": p.name, "count": len(p.hand)}
+                for p in get_active_players(self)
+            ]
         }
         await self.broadcast(state_msg)
 
@@ -265,6 +269,7 @@ class Room:
             self.state = "waiting"
             await self.broadcast({"type": "game_over", "winner": winner, "state": self.state})
             await self.log_chat(f"{winner}が勝利しました")
+            await publish_score_log(self, winner)
             return True
         return False
 
@@ -355,20 +360,46 @@ class Player:
 ################################################
 
 def check_win_condition(room):
-    # 1. プレイヤー1人による特殊勝利
-    if len(room.players) == 1:
-        return room.players[0].name
+    active_players = get_active_players(room)
+
+    # 1. 対戦参加者が1人だけになった場合の特殊勝利
+    if room.state == "playing" and len(active_players) == 1:
+        return active_players[0].name
+
+    if len(active_players) == 0:
+        return None
+
     # 2. 現在プレイヤーの手札0枚による通常勝利
     current_turn_id = room.current_turn_id
     if current_turn_id is None:
         return None
-    # room.playersはPlayerオブジェクトのリストであるとする
-    current_player = next((p for p in room.players if p.id == current_turn_id), None)
+    current_player = next((p for p in active_players if p.id == current_turn_id), None)
     if current_player is not None:
         if len(current_player.hand) == 0:
             # 勝利者のIDまたはPlayerオブジェクトそのものを返す（要件に応じて）
             return current_player.name
     return None
+
+def get_active_players(room) -> List["Player"]:
+    return [p for p in room.players if p.status == "waiting"]
+
+def record_score_event(room: Room, player: "Player", notation: str, result: str) -> None:
+    room.score_log.append({
+        "turn": len(room.score_log) + 1,
+        "player": player.name,
+        "notation": notation,
+        "result": result,
+    })
+
+async def publish_score_log(room: Room, winner: Optional[str]) -> None:
+    if not room.score_log:
+        return
+    await room.broadcast({
+        "type": "score_record",
+        "sender": "system",
+        "winner": winner,
+        "records": room.score_log,
+    })
 
 ################################################
 # カード生成と配布のユーティリティ
@@ -540,7 +571,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 room = player.room
                 new_status = data["status"]
                 player.status = new_status
+                if new_status != "waiting":
+                    player.clear_hand()
+                    await player.send_hand_update()
                 await room.update_room_status()
+                if room.state == "playing" and await room.try_end_game():
+                    await room.update_room_status()
 
             elif msg_type == "start_game":
                 if not player.room:
@@ -548,7 +584,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 room = player.room
 
                 # 対戦待ちプレイヤー確認
-                waiting_players = [p for p in room.players if p.status == "waiting"]
+                waiting_players = get_active_players(room)
                 if len(waiting_players) != 2:
                     await websocket.send_json({"type": "error", "message": "対戦待ちが2人必要です。"})
                     continue
@@ -595,6 +631,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if len(room.deck) > 0:
                     drawn = room.deck.pop(0)
                     player.add_card(drawn)
+                    record_score_event(room, player, "ドロー", "1枚")
 
                     # 自分に手札更新を送る
                     await player.send_hand_update()
@@ -625,6 +662,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 # チャットにパスのログを流す
                 await room.log_chat(f"{player.name}がパスしました")
+                record_score_event(room, player, "パス", "場流し")
                 # 次のターンへ
                 await next_turn(room)
 
@@ -667,6 +705,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         room.has_drawn = False
         await player.send_hand_update()
         await room.log_chat(f"{player.name}がジョーカーを出しました、インフィニティ！")
+        record_score_event(room, player, "Joker(∞)", "場流し")
         await room.update_game_state()
         if await room.try_end_game():
             await room.update_room_status()
@@ -749,6 +788,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         # クライアントの表示を更新
         await player.send_hand_update()
         await room.log_chat(f"{player.name}が57を出しました、グロタンカット！")
+        record_score_event(room, player, "57", "グロタンカット")
         await room.update_game_state()
         if await room.try_end_game():
             await room.update_room_status()
@@ -769,6 +809,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         await room.update_game_state()
         # ログ
         await room.log_chat(f"{player.name}が1729を出しました、ラマヌジャン革命！")
+        record_score_event(room, player, "1729", "ラマヌジャン革命")
 
         # 通常の素数出しと同じく次のターンへ
         await next_turn(room)
@@ -801,6 +842,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         # チャットにペナルティのログを流す
         rule_name = rule_display_name(room.rule.prime_rule)
         await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は{rule_name}ではありません")
+        record_score_event(room, player, str(number), f"{rule_name}ではないためペナルティ")
 
         await next_turn(room)
         return
@@ -825,9 +867,12 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
 
     # チャットに「素数を出した」ログを流す
     await room.log_chat(f"{player.name}が{number}を出しました")
+    record_score_event(room, player, str(number), "成功")
     await next_turn(room)
 
-MAX_EXP = 122  # 安全ガード
+# 現行ルールでは指数が122を超える合法手が存在しないため、
+# 計算量を抑える実用上の上限として122を採用する。
+MAX_EXP = 122
 
 # エラーメッセージ & 分類
 class CompositeError(Exception):
@@ -1123,6 +1168,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
             "number": sel_number
         })
         await room.log_chat(f"{player.name}の合成数は不正でした（{e.msg}）。ペナルティ。")
+        record_score_event(room, player, str(sel_number), f"合成数不正: {e.msg}")
         await next_turn(room)
         return
 
@@ -1155,6 +1201,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         "mode": "composite"
     })
     await room.log_chat(f"{player.name}が合成数 {sel_number} を出しました")
+    record_score_event(room, player, f"合成数 {sel_number}", "成功")
     await next_turn(room)
 
 
@@ -1178,14 +1225,26 @@ async def leave_room(player):
 
         # 退出通知
         await room.log_chat(f"{player.name}が退室しました")
+        if room.state == "playing" and player.status == "waiting":
+            record_score_event(room, player, "退出", "対戦離脱")
+        player.clear_hand()
+
         # ゲーム中の特別処理
         if room.state == "playing":
-            # 参加プレイヤーが1人だけになったら、ゲーム終了
-            if len(room.players) == 1:
-                winner_name = room.players[0].name
-                await room.broadcast({"type": "game_over", "winner": winner_name})
-                await room.log_chat(f"{winner_name}が勝利しました")
+            active_players = get_active_players(room)
+            if len(active_players) == 1:
+                winner_name = active_players[0].name
                 room.state = "waiting"
+                room.current_turn_id = None
+                await room.broadcast({"type": "game_over", "winner": winner_name, "state": room.state})
+                await room.log_chat(f"{winner_name}が勝利しました")
+                await publish_score_log(room, winner_name)
+            elif len(active_players) == 0:
+                room.state = "waiting"
+                room.current_turn_id = None
+                await room.broadcast({"type": "game_over", "winner": None, "state": room.state})
+                await room.log_chat("対戦者がいなくなったためゲームを終了しました")
+                await publish_score_log(room, None)
             elif room.current_turn_id == player.id: # 現在ターンのプレイヤーが切断した場合、次のターンに進める
                 await next_turn(room)
 
@@ -1202,10 +1261,14 @@ async def start_game(room):
     room.has_drawn = False         # ドロー済みフラグもクリア
 
     # 1) 待機中の2人を確定
-    waiting_players = [p for p in room.players if p.status == "waiting"]
+    waiting_players = get_active_players(room)
     if len(waiting_players) != 2:
         return
     p1, p2 = waiting_players
+    for p in room.players:
+        if p not in waiting_players:
+            p.clear_hand()
+            await p.send_hand_update()
 
     # 2) デッキ生成→配布（プリセット準拠）
     deck = build_deck(room.rule)
@@ -1216,6 +1279,7 @@ async def start_game(room):
     room.reserve = []
     room.field = []  # 場のカードは空
     room.last_number = None
+    room.score_log = []
     p1.sort_hand()
     p2.sort_hand()
     room.state = "playing"
@@ -1245,7 +1309,7 @@ async def next_turn(room):
     room.has_drawn = False
 
     # 対戦に参加している（statusが"waiting"の）プレイヤーだけを対象とする
-    active_players = [p for p in room.players if p.status == "waiting"]
+    active_players = get_active_players(room)
     if len(active_players) < 2:
         return
 
