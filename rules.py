@@ -17,6 +17,7 @@ class PrimeRule(Enum):
     NORMAL = auto()       # 通常の素数
     TETRAD = auto()       # 四つ子素数
     SEMIPRIME = auto()    # 半素数
+    REGISTERED = auto()   # プレイヤーごとの登録済み素数
 
 @dataclass(frozen=True)
 class RulePreset:
@@ -130,5 +131,14 @@ PRESETS: Dict[str, RulePreset] = {
         penalty_rule=PenaltyRule.NORMAL,
         allow_composite=True,
         prime_rule=PrimeRule.SEMIPRIME,
+    ),
+    "registered-11-n": RulePreset(
+        key="registered-11-n",
+        label="登録素数: 11枚 / 通常",
+        deck_rule=DeckRule.DEFAULT,
+        hand_size=11,
+        penalty_rule=PenaltyRule.NORMAL,
+        allow_composite=False,
+        prime_rule=PrimeRule.REGISTERED,
     ),
 }

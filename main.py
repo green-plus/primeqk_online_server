@@ -1,6 +1,10 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from dataclasses import asdict
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule
+from registered_primes import parse_registered_prime_text
+import json
 import random
 from random import randrange
 import secrets
@@ -11,6 +15,8 @@ from math import gcd
 import time
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+SERVER_DIR = Path(__file__).resolve().parent
+SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
 app = FastAPI()
 
 ################################################
@@ -193,11 +199,18 @@ def is_valid_prime_by_rule(n: int, rule: RulePreset) -> bool:
         return is_semiprime(n)
     return is_prime(n)
 
+def is_valid_prime_for_player(n: int, player: "Player", rule: RulePreset) -> bool:
+    if rule.prime_rule is PrimeRule.REGISTERED:
+        return player.can_use_registered_prime(n)
+    return is_valid_prime_by_rule(n, rule)
+
 def rule_display_name(prime_rule: PrimeRule) -> str:
     if prime_rule is PrimeRule.TETRAD:
         return "四つ子素数"
     if prime_rule is PrimeRule.SEMIPRIME:
         return "半素数"
+    if prime_rule is PrimeRule.REGISTERED:
+        return "登録済み素数"
     return "素数"
 
 ################################################
@@ -229,9 +242,15 @@ class Room:
             "room_id": self.room_id,
             "rule": self.rule.label,
             "allow_composite": self.rule.allow_composite,
+            "prime_rule": self.rule.prime_rule.name.lower(),
             "count": len(self.players),
             "player_list": [
-                {"id": p.id, "name": p.name, "status": p.status}
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "status": p.status,
+                    "registered_prime_count": len(p.registered_primes),
+                }
                 for p in self.players
             ],
             "waiting_count": len([p for p in self.players if p.status == "waiting"])
@@ -252,9 +271,18 @@ class Room:
             "current_turn": current_name,
             "revolution": self.reverse_order,
             "allow_composite": self.rule.allow_composite,
+            "prime_rule": self.rule.prime_rule.name.lower(),
             "deck_count": len(self.deck),
             "field": self.field,
-            "player_list": [{"id": p.id, "name": p.name, "status": p.status} for p in self.players],
+            "player_list": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "status": p.status,
+                    "registered_prime_count": len(p.registered_primes),
+                }
+                for p in self.players
+            ],
             "hand_counts": [
                 {"id": p.id, "name": p.name, "count": len(p.hand)}
                 for p in get_active_players(self)
@@ -291,6 +319,7 @@ ROOM_CONFIG = [
     ("room_10", PRESETS["tetrad-11-n-c"]),
     ("room_11", PRESETS["semiprime-11-n"]),
     ("room_12", PRESETS["semiprime-11-n-c"]),
+    ("room_13", PRESETS["registered-11-n"]),
 ]
 rooms = {rid: Room(rid, rule) for rid, rule in ROOM_CONFIG}
 
@@ -303,6 +332,7 @@ class Player:
         self.room = None  # 所属ルーム（Roomオブジェクト）
         self.status = "watching"  # 初期状態は観戦中
         self.hand = []  # プレイヤーが持つカードリスト
+        self.registered_primes: set[int] = set()
 
     async def send_json(self, message: dict):
         """WebSocketを通じてJSONメッセージを送信する"""
@@ -354,6 +384,12 @@ class Player:
     def clear_hand(self):
         """手札をクリアする"""
         self.hand = []
+
+    def replace_registered_primes(self, values: set[int]) -> None:
+        self.registered_primes = set(values)
+
+    def can_use_registered_prime(self, n: int) -> bool:
+        return n in self.registered_primes
 
 ################################################
 # 勝敗判定ロジック
@@ -557,6 +593,50 @@ def get_penalty_card_count(rule: PenaltyRule, field_card_count: int, normal_card
     if rule is PenaltyRule.NORMAL:
         return normal_card_count
     return normal_card_count
+
+def missing_registered_prime_players(room: Room) -> List["Player"]:
+    if room.rule.prime_rule is not PrimeRule.REGISTERED:
+        return []
+    return [p for p in get_active_players(room) if not p.registered_primes]
+
+def registered_prime_update_payload(result) -> dict:
+    return {
+        "type": "registered_primes_updated",
+        "count": len(result.prime_values),
+        "duplicate_count": result.duplicate_count,
+        "errors": [asdict(error) for error in result.errors],
+        "truncated": result.truncated,
+    }
+
+def replace_player_registered_primes_from_text(player: "Player", text: str) -> dict:
+    result = parse_registered_prime_text(text)
+    player.replace_registered_primes(set(result.prime_values))
+    return registered_prime_update_payload(result)
+
+def load_sample_prime_values() -> tuple[int, ...]:
+    if not SAMPLE_MEMORY_JSON.exists():
+        return ()
+    data = json.loads(SAMPLE_MEMORY_JSON.read_text(encoding="utf-8-sig"))
+    prime_text = data.get("primeText", "")
+    values = []
+    for line in prime_text.splitlines():
+        token = line.strip()
+        if token:
+            values.append(int(token))
+    return tuple(sorted(set(values)))
+
+SAMPLE_REGISTERED_PRIMES = load_sample_prime_values()
+
+def load_sample_registered_prime_payload(player: "Player") -> dict:
+    player.replace_registered_primes(set(SAMPLE_REGISTERED_PRIMES))
+    return {
+        "type": "registered_primes_updated",
+        "count": len(player.registered_primes),
+        "duplicate_count": 0,
+        "errors": [],
+        "truncated": False,
+        "sample": True,
+    }
 ################################################
 # Webhook
 ################################################
@@ -597,11 +677,58 @@ async def websocket_endpoint(websocket: WebSocket):
                 # 必要なら acknowledgment を返す
                 await player.send_json({"type": "name_set", "name": player.name})
                 continue
+            elif msg_type == "set_registered_primes":
+                if player.room and player.room.state == "playing":
+                    await player.send_json({
+                        "type": "error",
+                        "message": "対戦中は登録素数を変更できません。",
+                    })
+                    continue
+
+                text = data.get("text", "")
+                if not isinstance(text, str):
+                    await player.send_json({
+                        "type": "error",
+                        "message": "登録素数の入力形式が不正です。",
+                    })
+                    continue
+
+                await player.send_json(replace_player_registered_primes_from_text(player, text))
+
+                if player.room:
+                    await player.room.update_room_status()
+                continue
+            elif msg_type == "load_sample_registered_primes":
+                if player.room and player.room.state == "playing":
+                    await player.send_json({
+                        "type": "error",
+                        "message": "対戦中は登録素数を変更できません。",
+                    })
+                    continue
+                if not SAMPLE_REGISTERED_PRIMES:
+                    await player.send_json({
+                        "type": "error",
+                        "message": "サンプル登録素数メモリがサーバーに見つかりません。",
+                    })
+                    continue
+
+                await player.send_json(load_sample_registered_prime_payload(player))
+
+                if player.room:
+                    await player.room.update_room_status()
+                continue
             elif msg_type == "get_room_counts":
                 counts = {room_id: len(room.players) for room_id, room in rooms.items()}
                 rules  = {rid: room.rule.label for rid, room in rooms.items()}
                 allow_composite = {rid: room.rule.allow_composite for rid, room in rooms.items()}
-                await websocket.send_json({"type": "room_counts", "counts": counts, "rules": rules, "allow_composite": allow_composite})
+                prime_rules = {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()}
+                await websocket.send_json({
+                    "type": "room_counts",
+                    "counts": counts,
+                    "rules": rules,
+                    "allow_composite": allow_composite,
+                    "prime_rules": prime_rules,
+                })
 
             elif msg_type == "join_room":
                 rid = data["room_id"]
@@ -623,7 +750,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 player.status = "watching"  # 仮に入室したらwatchingに
 
                 await room.update_room_status()
-                await room.broadcast({"type": "room_state_initialization", "room_state": room.state, "allow_composite": room.rule.allow_composite})
+                await room.broadcast({
+                    "type": "room_state_initialization",
+                    "room_state": room.state,
+                    "allow_composite": room.rule.allow_composite,
+                    "prime_rule": room.rule.prime_rule.name.lower(),
+                })
 
             elif msg_type == "leave_room":
                 await leave_room(player)
@@ -650,6 +782,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 waiting_players = get_active_players(room)
                 if len(waiting_players) != 2:
                     await websocket.send_json({"type": "error", "message": "対戦待ちが2人必要です。"})
+                    continue
+                missing_registered = missing_registered_prime_players(room)
+                if missing_registered:
+                    names = ", ".join(p.name for p in missing_registered)
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"登録素数が未設定のプレイヤーがいます: {names}",
+                    })
                     continue
 
                 await start_game(room)
@@ -881,7 +1021,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         await next_turn(room)
         return
     # 素数判定
-    if not is_valid_prime_by_rule(number, room.rule):
+    if not is_valid_prime_for_player(number, player, room.rule):
         # ペナルティ
         # 出そうとしたカードを引き直すことはしない(そもそも出されていないため)
         penalty_cards = get_penalty_card_count(
@@ -1383,6 +1523,7 @@ async def start_game(room):
     await room.broadcast({
         "type": "game_start",
         "allow_composite": room.rule.allow_composite,
+        "prime_rule": room.rule.prime_rule.name.lower(),
     })
     await room.update_game_state()
     # チャットにログを流す
