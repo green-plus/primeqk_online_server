@@ -233,8 +233,20 @@ class Room:
         self.score_log = []
 
     async def broadcast(self, message: dict):
-        for p in self.players:
-            await p.send_json(message)
+        disconnected = []
+        for p in list(self.players):
+            try:
+                await p.send_json(message)
+            except Exception as exc:
+                print(f"broadcast failed in {self.room_id}: {exc}")
+                disconnected.append(p)
+        for p in disconnected:
+            if p in self.players:
+                self.players.remove(p)
+            if p.room is self:
+                p.room = None
+                p.status = "watching"
+                p.clear_hand()
 
     async def update_room_status(self):
         message = {
@@ -243,6 +255,7 @@ class Room:
             "rule": self.rule.label,
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
+            "assist_enabled": self.rule.assist_enabled,
             "count": len(self.players),
             "player_list": [
                 {
@@ -273,6 +286,7 @@ class Room:
             "revolution": self.reverse_order,
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
+            "assist_enabled": self.rule.assist_enabled,
             "deck_count": len(self.deck),
             "field": self.field,
             "player_list": [
@@ -322,6 +336,7 @@ ROOM_CONFIG = [
     ("room_11", PRESETS["semiprime-11-n"]),
     ("room_12", PRESETS["semiprime-11-n-c"]),
     ("room_13", PRESETS["registered-11-n"]),
+    ("room_14", PRESETS["registered-11-n-assist"]),
 ]
 rooms = {rid: Room(rid, rule) for rid, rule in ROOM_CONFIG}
 
@@ -678,6 +693,116 @@ def load_sample_registered_prime_payload(player: "Player") -> dict:
         "sample_prime_text": SAMPLE_REGISTERED_PRIME_TEXT,
         "sample_composite_text": SAMPLE_REGISTERED_COMPOSITE_TEXT,
     }
+
+def field_allows_number(room: Room, number: int, card_count: int) -> bool:
+    if room.field and card_count != len(room.field):
+        return False
+    if room.field:
+        field_number = room.last_number if room.last_number is not None else -1
+        if not room.reverse_order and number <= field_number:
+            return False
+        if room.reverse_order and number >= field_number:
+            return False
+    return True
+
+def find_prime_realization(
+    number: int,
+    source_cards: List[dict],
+    required_card_count: Optional[int] = None,
+) -> Optional[dict]:
+    text = str(number)
+    used: list[dict] = []
+    assigned_by_card_id: dict[str, str] = {}
+
+    def visit(index: int, remaining: list[dict]) -> bool:
+        if required_card_count is not None and len(used) > required_card_count:
+            return False
+        if index == len(text):
+            return required_card_count is None or len(used) == required_card_count
+
+        for i, card in enumerate(remaining):
+            options: list[str]
+            if card.get("is_joker") or card.get("suit") == "X":
+                options = [str(v) for v in range(14)]
+            else:
+                options = [str(card.get("rank"))]
+
+            for option in options:
+                if not text.startswith(option, index):
+                    continue
+                used.append(card)
+                if card.get("is_joker") or card.get("suit") == "X":
+                    assigned_by_card_id[card["card_id"]] = option
+                next_remaining = remaining[:i] + remaining[i + 1:]
+                if visit(index + len(option), next_remaining):
+                    return True
+                if card.get("is_joker") or card.get("suit") == "X":
+                    assigned_by_card_id.pop(card["card_id"], None)
+                used.pop()
+        return False
+
+    if not visit(0, source_cards[:]):
+        return None
+
+    assigned_numbers = [
+        assigned_by_card_id[card["card_id"]]
+        for card in used
+        if card.get("is_joker") or card.get("suit") == "X"
+    ]
+    return {
+        "number": number,
+        "cards": used[:],
+        "assigned_numbers": assigned_numbers,
+    }
+
+def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> dict:
+    if (
+        room.rule.prime_rule is not PrimeRule.REGISTERED
+        or not room.rule.assist_enabled
+    ):
+        return {"candidates": [], "truncated": False, "source": "hand"}
+
+    selected_ids = data.get("selected_card_ids") or []
+    if not isinstance(selected_ids, list):
+        selected_ids = []
+
+    hand_by_id = {card["card_id"]: card for card in player.hand}
+    source_cards = [hand_by_id[cid] for cid in selected_ids if cid in hand_by_id]
+    source = "selected" if source_cards else "hand"
+    if not source_cards:
+        source_cards = player.hand[:]
+
+    required_card_count = len(room.field) if room.field else None
+    limit = data.get("limit", 100)
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 100
+
+    candidates = []
+    registered_numbers = [("prime", number) for number in player.registered_primes]
+    if room.rule.allow_composite:
+        registered_numbers.extend(
+            ("composite", number) for number in player.registered_composites
+        )
+    registered_numbers.sort(key=lambda item: item[1], reverse=room.reverse_order)
+
+    for kind, number in registered_numbers:
+        if not field_allows_number(room, number, required_card_count or 1):
+            # The count is rechecked after realization when no field exists.
+            if room.field:
+                continue
+        realization = find_prime_realization(number, source_cards, required_card_count)
+        if realization is None:
+            continue
+        if not field_allows_number(room, number, len(realization["cards"])):
+            continue
+        realization["kind"] = kind
+        candidates.append(realization)
+        if len(candidates) >= limit:
+            return {"candidates": candidates, "truncated": True, "source": source}
+
+    return {"candidates": candidates, "truncated": False, "source": source}
 ################################################
 # Webhook
 ################################################
@@ -768,17 +893,36 @@ async def websocket_endpoint(websocket: WebSocket):
                 rules  = {rid: room.rule.label for rid, room in rooms.items()}
                 allow_composite = {rid: room.rule.allow_composite for rid, room in rooms.items()}
                 prime_rules = {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()}
+                assist_enabled = {rid: room.rule.assist_enabled for rid, room in rooms.items()}
                 await websocket.send_json({
                     "type": "room_counts",
                     "counts": counts,
                     "rules": rules,
                     "allow_composite": allow_composite,
                     "prime_rules": prime_rules,
+                    "assist_enabled": assist_enabled,
                 })
 
             elif msg_type == "join_room":
                 rid = data["room_id"]
-                room = rooms[rid]
+                room = rooms.get(rid)
+                if room is None:
+                    await websocket.send_json({"type": "error", "message": "room not found"})
+                    continue
+
+                if player.room is room:
+                    await room.update_room_status()
+                    await player.send_json({
+                        "type": "room_state_initialization",
+                        "room_state": room.state,
+                        "allow_composite": room.rule.allow_composite,
+                        "prime_rule": room.rule.prime_rule.name.lower(),
+                        "assist_enabled": room.rule.assist_enabled,
+                    })
+                    continue
+
+                if player.room:
+                    await leave_room(player)
 
                 if len(room.players) >= 10:
                     await websocket.send_json({"type": "error", "message": "部屋が満員です。"})
@@ -801,6 +945,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "room_state": room.state,
                     "allow_composite": room.rule.allow_composite,
                     "prime_rule": room.rule.prime_rule.name.lower(),
+                    "assist_enabled": room.rule.assist_enabled,
                 })
 
             elif msg_type == "leave_room":
@@ -839,6 +984,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 await start_game(room)
+
+            elif msg_type == "get_prime_assist":
+                if not player.room:
+                    continue
+                room = player.room
+                await player.send_json({
+                    "type": "prime_assist_result",
+                    **build_prime_assist_candidates(player, room, data),
+                })
+                continue
 
             elif msg_type == "play_card":
                 if not player.room:
@@ -1575,6 +1730,7 @@ async def start_game(room):
         "type": "game_start",
         "allow_composite": room.rule.allow_composite,
         "prime_rule": room.rule.prime_rule.name.lower(),
+        "assist_enabled": room.rule.assist_enabled,
     })
     await room.update_game_state()
     # チャットにログを流す
