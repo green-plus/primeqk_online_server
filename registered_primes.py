@@ -49,6 +49,14 @@ class RegisteredPrimeParseResult:
     truncated: bool = False
 
 
+@dataclass(frozen=True)
+class RegisteredCompositeParseResult:
+    composite_values: tuple[int, ...]
+    errors: tuple[RegisteredPrimeError, ...]
+    duplicate_count: int
+    truncated: bool = False
+
+
 def tokenize_registered_prime_pattern(pattern: str) -> tuple[int, ...]:
     """Convert pasted physical-card notation to ranks.
 
@@ -67,6 +75,13 @@ def tokenize_registered_prime_pattern(pattern: str) -> tuple[int, ...]:
 def registered_prime_pattern_value(pattern: str) -> int:
     text = "".join(str(FACE_VALUES.get(char, char)) for char in pattern.strip().lower())
     return int(text)
+
+
+def registered_number_pattern_value(pattern: str) -> int:
+    pattern = pattern.strip().lower()
+    if not TOKEN_RE.fullmatch(pattern):
+        raise ValueError("invalid token")
+    return registered_prime_pattern_value(pattern)
 
 
 def registered_cards_value(cards: tuple[int, ...]) -> int:
@@ -340,3 +355,54 @@ def _csv_int(value: str | None, default):
         return int(value)
     except ValueError:
         return default
+
+
+def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult:
+    if len(text) > MAX_REGISTERED_PRIME_TEXT_LENGTH:
+        return RegisteredCompositeParseResult(
+            composite_values=(),
+            errors=(RegisteredPrimeError(0, "", "input too long"),),
+            duplicate_count=0,
+            truncated=True,
+        )
+
+    errors: list[RegisteredPrimeError] = []
+    seen_values: set[int] = set()
+    duplicate_count = 0
+
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        left = stripped.split("=", 1)[0].split("|", 1)[0].strip()
+        token = left.split()[0] if left.split() else ""
+        if not token:
+            continue
+        if len(token) > MAX_REGISTERED_PRIME_DIGITS:
+            errors.append(RegisteredPrimeError(line_number, token, "token too long"))
+            continue
+        try:
+            value = registered_number_pattern_value(token)
+        except ValueError:
+            errors.append(RegisteredPrimeError(line_number, token, "invalid token"))
+            continue
+        if value < 4 or is_probable_prime_for_registration(value):
+            errors.append(RegisteredPrimeError(line_number, token, "not composite"))
+            continue
+        if value in seen_values:
+            duplicate_count += 1
+        seen_values.add(value)
+        if len(seen_values) > MAX_REGISTERED_PRIMES:
+            errors.append(RegisteredPrimeError(line_number, token, "too many composites"))
+            return RegisteredCompositeParseResult(
+                composite_values=tuple(sorted(seen_values)),
+                errors=tuple(errors),
+                duplicate_count=duplicate_count,
+                truncated=True,
+            )
+
+    return RegisteredCompositeParseResult(
+        composite_values=tuple(sorted(seen_values)),
+        errors=tuple(errors),
+        duplicate_count=duplicate_count,
+    )

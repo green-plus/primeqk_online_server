@@ -3,7 +3,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule
-from registered_primes import parse_registered_prime_text
+from registered_primes import parse_registered_composite_text, parse_registered_prime_text
 import json
 import random
 from random import randrange
@@ -250,6 +250,7 @@ class Room:
                     "name": p.name,
                     "status": p.status,
                     "registered_prime_count": len(p.registered_primes),
+                    "registered_composite_count": len(p.registered_composites),
                 }
                 for p in self.players
             ],
@@ -280,6 +281,7 @@ class Room:
                     "name": p.name,
                     "status": p.status,
                     "registered_prime_count": len(p.registered_primes),
+                    "registered_composite_count": len(p.registered_composites),
                 }
                 for p in self.players
             ],
@@ -333,6 +335,7 @@ class Player:
         self.status = "watching"  # 初期状態は観戦中
         self.hand = []  # プレイヤーが持つカードリスト
         self.registered_primes: set[int] = set()
+        self.registered_composites: set[int] = set()
 
     async def send_json(self, message: dict):
         """WebSocketを通じてJSONメッセージを送信する"""
@@ -390,6 +393,12 @@ class Player:
 
     def can_use_registered_prime(self, n: int) -> bool:
         return n in self.registered_primes
+
+    def replace_registered_composites(self, values: set[int]) -> None:
+        self.registered_composites = set(values)
+
+    def can_use_registered_composite(self, n: int) -> bool:
+        return n in self.registered_composites
 
 ################################################
 # 勝敗判定ロジック
@@ -597,45 +606,77 @@ def get_penalty_card_count(rule: PenaltyRule, field_card_count: int, normal_card
 def missing_registered_prime_players(room: Room) -> List["Player"]:
     if room.rule.prime_rule is not PrimeRule.REGISTERED:
         return []
-    return [p for p in get_active_players(room) if not p.registered_primes]
+    return [
+        p for p in get_active_players(room)
+        if not p.registered_primes and not p.registered_composites
+    ]
 
-def registered_prime_update_payload(result) -> dict:
+def registered_numbers_update_payload(prime_result, composite_result) -> dict:
     return {
-        "type": "registered_primes_updated",
-        "count": len(result.prime_values),
-        "duplicate_count": result.duplicate_count,
-        "errors": [asdict(error) for error in result.errors],
-        "truncated": result.truncated,
+        "type": "registered_numbers_updated",
+        "prime_count": len(prime_result.prime_values),
+        "composite_count": len(composite_result.composite_values),
+        "prime_duplicate_count": prime_result.duplicate_count,
+        "composite_duplicate_count": composite_result.duplicate_count,
+        "prime_errors": [asdict(error) for error in prime_result.errors],
+        "composite_errors": [asdict(error) for error in composite_result.errors],
+        "truncated": prime_result.truncated or composite_result.truncated,
     }
 
-def replace_player_registered_primes_from_text(player: "Player", text: str) -> dict:
-    result = parse_registered_prime_text(text)
-    player.replace_registered_primes(set(result.prime_values))
-    return registered_prime_update_payload(result)
+def replace_player_registered_numbers_from_text(
+    player: "Player",
+    prime_text: str,
+    composite_text: str,
+) -> dict:
+    prime_result = parse_registered_prime_text(prime_text)
+    composite_result = parse_registered_composite_text(composite_text)
+    player.replace_registered_primes(set(prime_result.prime_values))
+    player.replace_registered_composites(set(composite_result.composite_values))
+    return registered_numbers_update_payload(prime_result, composite_result)
 
-def load_sample_prime_values() -> tuple[int, ...]:
+def load_sample_memory() -> tuple[tuple[int, ...], tuple[int, ...], str, str]:
     if not SAMPLE_MEMORY_JSON.exists():
-        return ()
+        return (), (), "", ""
     data = json.loads(SAMPLE_MEMORY_JSON.read_text(encoding="utf-8-sig"))
-    prime_text = data.get("primeText", "")
+    prime_text = str(data.get("primeText", "")).strip()
+    composite_text = "\n".join(
+        part.strip()
+        for part in (
+            str(data.get("compositeText", "")).strip(),
+            str(data.get("additionalCompositeText", "")).strip(),
+        )
+        if part.strip()
+    )
     values = []
     for line in prime_text.splitlines():
         token = line.strip()
         if token:
             values.append(int(token))
-    return tuple(sorted(set(values)))
+    composite_values = parse_registered_composite_text(composite_text).composite_values
+    return tuple(sorted(set(values))), composite_values, prime_text, composite_text
 
-SAMPLE_REGISTERED_PRIMES = load_sample_prime_values()
+(
+    SAMPLE_REGISTERED_PRIMES,
+    SAMPLE_REGISTERED_COMPOSITES,
+    SAMPLE_REGISTERED_PRIME_TEXT,
+    SAMPLE_REGISTERED_COMPOSITE_TEXT,
+) = load_sample_memory()
 
 def load_sample_registered_prime_payload(player: "Player") -> dict:
     player.replace_registered_primes(set(SAMPLE_REGISTERED_PRIMES))
+    player.replace_registered_composites(set(SAMPLE_REGISTERED_COMPOSITES))
     return {
-        "type": "registered_primes_updated",
-        "count": len(player.registered_primes),
-        "duplicate_count": 0,
-        "errors": [],
+        "type": "registered_numbers_updated",
+        "prime_count": len(player.registered_primes),
+        "composite_count": len(player.registered_composites),
+        "prime_duplicate_count": 0,
+        "composite_duplicate_count": 0,
+        "prime_errors": [],
+        "composite_errors": [],
         "truncated": False,
         "sample": True,
+        "sample_prime_text": SAMPLE_REGISTERED_PRIME_TEXT,
+        "sample_composite_text": SAMPLE_REGISTERED_COMPOSITE_TEXT,
     }
 ################################################
 # Webhook
@@ -677,23 +718,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 # 必要なら acknowledgment を返す
                 await player.send_json({"type": "name_set", "name": player.name})
                 continue
-            elif msg_type == "set_registered_primes":
+            elif msg_type in ("set_registered_numbers", "set_registered_primes"):
                 if player.room and player.room.state == "playing":
                     await player.send_json({
                         "type": "error",
-                        "message": "対戦中は登録素数を変更できません。",
+                        "message": "対戦中は登録内容を変更できません。",
                     })
                     continue
 
-                text = data.get("text", "")
-                if not isinstance(text, str):
+                prime_text = data.get("prime_text", data.get("text", ""))
+                composite_text = data.get("composite_text", "")
+                if not isinstance(prime_text, str) or not isinstance(composite_text, str):
                     await player.send_json({
                         "type": "error",
-                        "message": "登録素数の入力形式が不正です。",
+                        "message": "登録内容の入力形式が不正です。",
                     })
                     continue
 
-                await player.send_json(replace_player_registered_primes_from_text(player, text))
+                await player.send_json(replace_player_registered_numbers_from_text(
+                    player,
+                    prime_text,
+                    composite_text,
+                ))
 
                 if player.room:
                     await player.room.update_room_status()
@@ -702,13 +748,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 if player.room and player.room.state == "playing":
                     await player.send_json({
                         "type": "error",
-                        "message": "対戦中は登録素数を変更できません。",
+                        "message": "対戦中は登録内容を変更できません。",
                     })
                     continue
-                if not SAMPLE_REGISTERED_PRIMES:
+                if not SAMPLE_REGISTERED_PRIMES and not SAMPLE_REGISTERED_COMPOSITES:
                     await player.send_json({
                         "type": "error",
-                        "message": "サンプル登録素数メモリがサーバーに見つかりません。",
+                        "message": "サンプル登録メモリがサーバーに見つかりません。",
                     })
                     continue
 
@@ -1366,6 +1412,11 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         # con を全て掛け合わせた number と sel_number は一致必須（不一致は MathError → ペナルティ）
         if number != sel_number:
             raise CompositeMathError("選択カードの数と合成数の値が一致しません。")
+        if (
+            room.rule.prime_rule is PrimeRule.REGISTERED
+            and not player.can_use_registered_composite(sel_number)
+        ):
+            raise CompositeMathError(f"{sel_number}は本人の登録済み合成数に含まれていません。")
     except CompositeSyntaxError as e:
         await player.ws.send_json({"type":"error","message":e.msg})
         return

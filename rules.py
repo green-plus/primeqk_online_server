@@ -134,11 +134,11 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "registered-11-n": RulePreset(
         key="registered-11-n",
-        label="登録素数: 11枚 / 通常",
+        label="登録素数・合成数: 11枚 / 通常",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
-        allow_composite=False,
+        allow_composite=True,
         prime_rule=PrimeRule.REGISTERED,
     ),
 }
