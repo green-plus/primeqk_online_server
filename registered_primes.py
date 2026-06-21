@@ -51,10 +51,28 @@ class RegisteredPrimeParseResult:
 
 @dataclass(frozen=True)
 class RegisteredCompositeParseResult:
+    entries: tuple["RegisteredCompositeEntry", ...]
     composite_values: tuple[int, ...]
     errors: tuple[RegisteredPrimeError, ...]
     duplicate_count: int
     truncated: bool = False
+
+
+@dataclass(frozen=True)
+class RegisteredCompositeExpressionToken:
+    kind: str
+    ranks: tuple[int, ...] = ()
+    op: str | None = None
+    text: str = ""
+
+
+@dataclass(frozen=True)
+class RegisteredCompositeEntry:
+    source_line: int
+    pattern: str
+    value: int
+    expression: str
+    expression_tokens: tuple[RegisteredCompositeExpressionToken, ...]
 
 
 def tokenize_registered_prime_pattern(pattern: str) -> tuple[int, ...]:
@@ -357,9 +375,51 @@ def _csv_int(value: str | None, default):
         return default
 
 
+def parse_registered_composite_expression(expression: str) -> tuple[RegisteredCompositeExpressionToken, ...]:
+    tokens: list[RegisteredCompositeExpressionToken] = []
+    current = []
+
+    def flush_current() -> None:
+        if not current:
+            return
+        text = "".join(current)
+        ranks = tokenize_registered_prime_pattern(text)
+        tokens.append(RegisteredCompositeExpressionToken(
+            kind="cards",
+            ranks=ranks,
+            text=text,
+        ))
+        current.clear()
+
+    for char in expression.strip().lower():
+        if char.isspace():
+            continue
+        if char in "*^":
+            flush_current()
+            tokens.append(RegisteredCompositeExpressionToken(kind="op", op=char, text=char))
+            continue
+        if TOKEN_RE.fullmatch(char):
+            current.append(char)
+            continue
+        raise ValueError("invalid expression token")
+
+    flush_current()
+    if not tokens:
+        raise ValueError("empty expression")
+    if tokens[0].kind != "cards" or tokens[-1].kind != "cards":
+        raise ValueError("expression must start and end with cards")
+    previous = None
+    for token in tokens:
+        if previous == token.kind:
+            raise ValueError("invalid expression order")
+        previous = token.kind
+    return tuple(tokens)
+
+
 def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult:
     if len(text) > MAX_REGISTERED_PRIME_TEXT_LENGTH:
         return RegisteredCompositeParseResult(
+            entries=(),
             composite_values=(),
             errors=(RegisteredPrimeError(0, "", "input too long"),),
             duplicate_count=0,
@@ -367,6 +427,7 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
         )
 
     errors: list[RegisteredPrimeError] = []
+    entries: list[RegisteredCompositeEntry] = []
     seen_values: set[int] = set()
     duplicate_count = 0
 
@@ -392,9 +453,27 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
         if value in seen_values:
             duplicate_count += 1
         seen_values.add(value)
+
+        if "=" in stripped:
+            expression = stripped.split("=", 1)[1].split("|", 1)[0].strip()
+            if expression:
+                try:
+                    expression_tokens = parse_registered_composite_expression(expression)
+                except ValueError:
+                    errors.append(RegisteredPrimeError(line_number, expression, "invalid expression"))
+                else:
+                    entries.append(RegisteredCompositeEntry(
+                        source_line=line_number,
+                        pattern=token,
+                        value=value,
+                        expression=expression,
+                        expression_tokens=expression_tokens,
+                    ))
+
         if len(seen_values) > MAX_REGISTERED_PRIMES:
             errors.append(RegisteredPrimeError(line_number, token, "too many composites"))
             return RegisteredCompositeParseResult(
+                entries=tuple(entries),
                 composite_values=tuple(sorted(seen_values)),
                 errors=tuple(errors),
                 duplicate_count=duplicate_count,
@@ -402,6 +481,7 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
             )
 
     return RegisteredCompositeParseResult(
+        entries=tuple(entries),
         composite_values=tuple(sorted(seen_values)),
         errors=tuple(errors),
         duplicate_count=duplicate_count,

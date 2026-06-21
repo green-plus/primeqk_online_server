@@ -351,6 +351,7 @@ class Player:
         self.hand = []  # プレイヤーが持つカードリスト
         self.registered_primes: set[int] = set()
         self.registered_composites: set[int] = set()
+        self.registered_composite_entries = ()
 
     async def send_json(self, message: dict):
         """WebSocketを通じてJSONメッセージを送信する"""
@@ -409,8 +410,9 @@ class Player:
     def can_use_registered_prime(self, n: int) -> bool:
         return n in self.registered_primes
 
-    def replace_registered_composites(self, values: set[int]) -> None:
+    def replace_registered_composites(self, values: set[int], entries=()) -> None:
         self.registered_composites = set(values)
+        self.registered_composite_entries = tuple(entries)
 
     def can_use_registered_composite(self, n: int) -> bool:
         return n in self.registered_composites
@@ -646,12 +648,15 @@ def replace_player_registered_numbers_from_text(
     prime_result = parse_registered_prime_text(prime_text)
     composite_result = parse_registered_composite_text(composite_text)
     player.replace_registered_primes(set(prime_result.prime_values))
-    player.replace_registered_composites(set(composite_result.composite_values))
+    player.replace_registered_composites(
+        set(composite_result.composite_values),
+        composite_result.entries,
+    )
     return registered_numbers_update_payload(prime_result, composite_result)
 
-def load_sample_memory() -> tuple[tuple[int, ...], tuple[int, ...], str, str]:
+def load_sample_memory() -> tuple[tuple[int, ...], tuple[int, ...], tuple, str, str]:
     if not SAMPLE_MEMORY_JSON.exists():
-        return (), (), "", ""
+        return (), (), (), "", ""
     data = json.loads(SAMPLE_MEMORY_JSON.read_text(encoding="utf-8-sig"))
     prime_text = str(data.get("primeText", "")).strip()
     composite_text = "\n".join(
@@ -667,19 +672,29 @@ def load_sample_memory() -> tuple[tuple[int, ...], tuple[int, ...], str, str]:
         token = line.strip()
         if token:
             values.append(int(token))
-    composite_values = parse_registered_composite_text(composite_text).composite_values
-    return tuple(sorted(set(values))), composite_values, prime_text, composite_text
+    composite_result = parse_registered_composite_text(composite_text)
+    return (
+        tuple(sorted(set(values))),
+        composite_result.composite_values,
+        composite_result.entries,
+        prime_text,
+        composite_text,
+    )
 
 (
     SAMPLE_REGISTERED_PRIMES,
     SAMPLE_REGISTERED_COMPOSITES,
+    SAMPLE_REGISTERED_COMPOSITE_ENTRIES,
     SAMPLE_REGISTERED_PRIME_TEXT,
     SAMPLE_REGISTERED_COMPOSITE_TEXT,
 ) = load_sample_memory()
 
 def load_sample_registered_prime_payload(player: "Player") -> dict:
     player.replace_registered_primes(set(SAMPLE_REGISTERED_PRIMES))
-    player.replace_registered_composites(set(SAMPLE_REGISTERED_COMPOSITES))
+    player.replace_registered_composites(
+        set(SAMPLE_REGISTERED_COMPOSITES),
+        SAMPLE_REGISTERED_COMPOSITE_ENTRIES,
+    )
     return {
         "type": "registered_numbers_updated",
         "prime_count": len(player.registered_primes),
@@ -697,6 +712,9 @@ def load_sample_registered_prime_payload(player: "Player") -> dict:
 def field_allows_number(room: Room, number: int, card_count: int) -> bool:
     if room.field and card_count != len(room.field):
         return False
+    return field_allows_number_value(room, number)
+
+def field_allows_number_value(room: Room, number: int) -> bool:
     if room.field:
         field_number = room.last_number if room.last_number is not None else -1
         if not room.reverse_order and number <= field_number:
@@ -755,6 +773,107 @@ def find_prime_realization(
         "assigned_numbers": assigned_numbers,
     }
 
+def remove_cards_by_id(cards: List[dict], used_cards: List[dict]) -> List[dict]:
+    used_ids = {card["card_id"] for card in used_cards}
+    return [card for card in cards if card["card_id"] not in used_ids]
+
+def find_rank_sequence_realization(
+    ranks: tuple[int, ...],
+    source_cards: List[dict],
+) -> Optional[dict]:
+    used: list[dict] = []
+    assigned_by_card_id: dict[str, str] = {}
+
+    def visit(index: int, remaining: list[dict]) -> bool:
+        if index == len(ranks):
+            return True
+        rank = ranks[index]
+
+        candidates = sorted(
+            enumerate(remaining),
+            key=lambda item: 1 if item[1].get("is_joker") or item[1].get("suit") == "X" else 0,
+        )
+        for i, card in candidates:
+            is_joker = card.get("is_joker") or card.get("suit") == "X"
+            if not is_joker and int(card.get("rank")) != rank:
+                continue
+            used.append(card)
+            if is_joker:
+                assigned_by_card_id[card["card_id"]] = str(rank)
+            next_remaining = remaining[:i] + remaining[i + 1:]
+            if visit(index + 1, next_remaining):
+                return True
+            if is_joker:
+                assigned_by_card_id.pop(card["card_id"], None)
+            used.pop()
+        return False
+
+    if not visit(0, source_cards[:]):
+        return None
+
+    return {
+        "cards": used[:],
+        "assigned_numbers": [
+            assigned_by_card_id[card["card_id"]]
+            for card in used
+            if card.get("is_joker") or card.get("suit") == "X"
+        ],
+    }
+
+def find_composite_expression_realization(entry, source_cards: List[dict]) -> Optional[dict]:
+    remaining = source_cards[:]
+    material_cards: list[dict] = []
+    assigned_numbers: list[str] = []
+    tokens: list[dict] = []
+
+    for token in entry.expression_tokens:
+        if token.kind == "op":
+            tokens.append({
+                "kind": "op",
+                "op": "×" if token.op == "*" else token.op,
+            })
+            continue
+
+        realization = find_rank_sequence_realization(token.ranks, remaining)
+        if realization is None:
+            return None
+        for card in realization["cards"]:
+            tokens.append({"kind": "card", "card_id": card["card_id"]})
+        material_cards.extend(realization["cards"])
+        assigned_numbers.extend(realization["assigned_numbers"])
+        remaining = remove_cards_by_id(remaining, realization["cards"])
+
+    return {
+        "tokens": tokens,
+        "cards": material_cards,
+        "assigned_numbers": assigned_numbers,
+    }
+
+def assist_limit_from_filters(data: dict) -> int:
+    filters = data.get("filters") or {}
+    if not isinstance(filters, dict):
+        filters = {}
+    if filters.get("limit_mode") == "ten":
+        return 10
+    limit = data.get("limit", 100)
+    try:
+        return max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        return 100
+
+def assist_filter_value(data: dict, key: str, default: str) -> str:
+    filters = data.get("filters") or {}
+    if not isinstance(filters, dict):
+        return default
+    value = filters.get(key)
+    return value if isinstance(value, str) else default
+
+def assist_number_sort_key(room: Room, order: str):
+    strong_first = order == "strong"
+    if room.reverse_order:
+        return (lambda item: item[1]) if strong_first else (lambda item: -item[1])
+    return (lambda item: -item[1]) if strong_first else (lambda item: item[1])
+
 def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> dict:
     if (
         room.rule.prime_rule is not PrimeRule.REGISTERED
@@ -772,32 +891,47 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     if not source_cards:
         source_cards = player.hand[:]
 
-    required_card_count = len(room.field) if room.field else None
-    limit = data.get("limit", 100)
-    try:
-        limit = max(1, min(int(limit), 200))
-    except (TypeError, ValueError):
-        limit = 100
+    count_scope = assist_filter_value(data, "count_scope", "field")
+    order = assist_filter_value(data, "order", "weak")
+    required_card_count = (
+        len(room.field)
+        if room.field and count_scope != "all"
+        else None
+    )
+    limit = assist_limit_from_filters(data)
 
     candidates = []
-    registered_numbers = [("prime", number) for number in player.registered_primes]
+    registered_numbers = [("prime", number, None) for number in player.registered_primes]
     if room.rule.allow_composite:
         registered_numbers.extend(
-            ("composite", number) for number in player.registered_composites
+            ("composite", entry.value, entry)
+            for entry in player.registered_composite_entries
+            if entry.value in player.registered_composites
         )
-    registered_numbers.sort(key=lambda item: item[1], reverse=room.reverse_order)
+    registered_numbers.sort(key=assist_number_sort_key(room, order))
 
-    for kind, number in registered_numbers:
-        if not field_allows_number(room, number, required_card_count or 1):
-            # The count is rechecked after realization when no field exists.
-            if room.field:
-                continue
+    for kind, number, entry in registered_numbers:
+        if not field_allows_number_value(room, number):
+            continue
         realization = find_prime_realization(number, source_cards, required_card_count)
         if realization is None:
             continue
-        if not field_allows_number(room, number, len(realization["cards"])):
+        if (
+            count_scope != "all"
+            and not field_allows_number(room, number, len(realization["cards"]))
+        ):
             continue
         realization["kind"] = kind
+        realization["field_count_match"] = (
+            not room.field or len(realization["cards"]) == len(room.field)
+        )
+        if kind == "composite":
+            material_source = remove_cards_by_id(player.hand, realization["cards"])
+            expression = find_composite_expression_realization(entry, material_source)
+            if expression is None:
+                continue
+            realization["expression"] = entry.expression
+            realization["composite"] = expression
         candidates.append(realization)
         if len(candidates) >= limit:
             return {"candidates": candidates, "truncated": True, "source": source}
