@@ -256,6 +256,7 @@ class Room:
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
             "assist_enabled": self.rule.assist_enabled,
+            "registration_enabled": self.rule.registration_enabled,
             "count": len(self.players),
             "player_list": [
                 {
@@ -287,6 +288,7 @@ class Room:
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
             "assist_enabled": self.rule.assist_enabled,
+            "registration_enabled": self.rule.registration_enabled,
             "deck_count": len(self.deck),
             "field": self.field,
             "player_list": [
@@ -325,9 +327,6 @@ ROOM_CONFIG = [
     ("room_3", PRESETS["std-11-f"]),
     ("room_4", PRESETS["half-5-f"]),
     ("room_5", PRESETS["half-7-1-c"]),
-    ("百鬼夜行1", PRESETS["half-7-1-c"]),
-    ("百鬼夜行2", PRESETS["half-7-1-c"]),
-    ("百鬼夜行3", PRESETS["half-7-1-c"]),
     ("room_6", PRESETS["std-11-f-c"]),
     ("room_7", PRESETS["std-11-n-c"]),
     ("room_8", PRESETS["std-11-n-c-rev"]),
@@ -337,6 +336,7 @@ ROOM_CONFIG = [
     ("room_12", PRESETS["semiprime-11-n-c"]),
     ("room_13", PRESETS["registered-11-n"]),
     ("room_14", PRESETS["registered-11-n-assist"]),
+    ("room_15", PRESETS["neo-assist-11-n-unlimited"]),
 ]
 rooms = {rid: Room(rid, rule) for rid, rule in ROOM_CONFIG}
 
@@ -621,7 +621,10 @@ def get_penalty_card_count(rule: PenaltyRule, field_card_count: int, normal_card
     return normal_card_count
 
 def missing_registered_prime_players(room: Room) -> List["Player"]:
-    if room.rule.prime_rule is not PrimeRule.REGISTERED:
+    if (
+        room.rule.prime_rule is not PrimeRule.REGISTERED
+        or not room.rule.registration_enabled
+    ):
         return []
     return [
         p for p in get_active_players(room)
@@ -876,7 +879,7 @@ def assist_number_sort_key(room: Room, order: str):
 
 def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> dict:
     if (
-        room.rule.prime_rule is not PrimeRule.REGISTERED
+        not room.rule.registration_enabled
         or not room.rule.assist_enabled
     ):
         return {"candidates": [], "truncated": False, "source": "hand"}
@@ -1028,6 +1031,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 allow_composite = {rid: room.rule.allow_composite for rid, room in rooms.items()}
                 prime_rules = {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()}
                 assist_enabled = {rid: room.rule.assist_enabled for rid, room in rooms.items()}
+                registration_enabled = {rid: room.rule.registration_enabled for rid, room in rooms.items()}
                 await websocket.send_json({
                     "type": "room_counts",
                     "counts": counts,
@@ -1035,6 +1039,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "allow_composite": allow_composite,
                     "prime_rules": prime_rules,
                     "assist_enabled": assist_enabled,
+                    "registration_enabled": registration_enabled,
                 })
 
             elif msg_type == "join_room":
@@ -1052,6 +1057,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "allow_composite": room.rule.allow_composite,
                         "prime_rule": room.rule.prime_rule.name.lower(),
                         "assist_enabled": room.rule.assist_enabled,
+                        "registration_enabled": room.rule.registration_enabled,
                     })
                     continue
 
@@ -1080,6 +1086,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "allow_composite": room.rule.allow_composite,
                     "prime_rule": room.rule.prime_rule.name.lower(),
                     "assist_enabled": room.rule.assist_enabled,
+                    "registration_enabled": room.rule.registration_enabled,
                 })
 
             elif msg_type == "leave_room":
@@ -1865,6 +1872,7 @@ async def start_game(room):
         "allow_composite": room.rule.allow_composite,
         "prime_rule": room.rule.prime_rule.name.lower(),
         "assist_enabled": room.rule.assist_enabled,
+        "registration_enabled": room.rule.registration_enabled,
     })
     await room.update_game_state()
     # チャットにログを流す

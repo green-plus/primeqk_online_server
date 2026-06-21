@@ -30,6 +30,7 @@ class RulePreset:
     start_revolution: bool = False
     prime_rule: PrimeRule = PrimeRule.NORMAL
     assist_enabled: bool = False
+    registration_enabled: bool = False
 
 PRESETS: Dict[str, RulePreset] = {
     "std-5-1": RulePreset(
@@ -141,6 +142,7 @@ PRESETS: Dict[str, RulePreset] = {
         penalty_rule=PenaltyRule.NORMAL,
         allow_composite=True,
         prime_rule=PrimeRule.REGISTERED,
+        registration_enabled=True,
     ),
     "registered-11-n-assist": RulePreset(
         key="registered-11-n-assist",
@@ -151,5 +153,16 @@ PRESETS: Dict[str, RulePreset] = {
         allow_composite=True,
         prime_rule=PrimeRule.REGISTERED,
         assist_enabled=True,
+        registration_enabled=True,
+    ),
+    "neo-assist-11-n-unlimited": RulePreset(
+        key="neo-assist-11-n-unlimited",
+        label="NEO練習: 11枚 / 通常 / 登録アシストあり / 制限なし",
+        deck_rule=DeckRule.DEFAULT,
+        hand_size=11,
+        penalty_rule=PenaltyRule.NORMAL,
+        allow_composite=True,
+        assist_enabled=True,
+        registration_enabled=True,
     ),
 }
