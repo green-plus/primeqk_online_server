@@ -157,7 +157,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "neo-assist-11-n-unlimited": RulePreset(
         key="neo-assist-11-n-unlimited",
-        label="NEO練習: 11枚 / 通常 / 登録アシストあり / 制限なし",
+        label="素数: 11枚 / 通常 / 登録アシストあり / 制限なし",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
