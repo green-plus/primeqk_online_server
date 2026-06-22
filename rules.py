@@ -35,19 +35,19 @@ class RulePreset:
 PRESETS: Dict[str, RulePreset] = {
     "std-5-1": RulePreset(
         key="std-5-1",
-        label="標準: 5枚 / ペナ1",
+        label="5枚 / ペナ1",
         deck_rule=DeckRule.DEFAULT,
         hand_size=5,
         penalty_rule=PenaltyRule.ALWAYS_1,
-        allow_composite=False,
+        allow_composite=True,
     ),
     "std-7-1": RulePreset(
         key="std-7-1",
-        label="標準: 7枚 / ペナ1",
+        label="7枚 / ペナ1",
         deck_rule=DeckRule.DEFAULT,
         hand_size=7,
         penalty_rule=PenaltyRule.ALWAYS_1,
-        allow_composite=False,
+        allow_composite=True,
     ),
     "std-11-f": RulePreset(
         key="std-11-f",
@@ -59,7 +59,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "std-11-f-c": RulePreset(
         key="std-11-f-c",
-        label="標準: 11枚 / 場の枚数 / 合成数あり",
+        label="11枚 / ペナ場の枚数",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.FIELD_COUNT,
@@ -67,15 +67,23 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "std-11-n-c": RulePreset(
         key="std-11-n-c",
-        label="標準: 11枚 / 通常 / 合成数あり",
+        label="11枚 / 通常",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
         allow_composite=True,
     ),
+    "std-11-n-no-c": RulePreset(
+        key="std-11-n-no-c",
+        label="11枚 / 合成数なし",
+        deck_rule=DeckRule.DEFAULT,
+        hand_size=11,
+        penalty_rule=PenaltyRule.NORMAL,
+        allow_composite=False,
+    ),
     "std-11-n-c-rev": RulePreset(
         key="std-11-n-c-rev",
-        label="標準: 11枚 / 通常 / 合成数あり / 初期革命",
+        label="初期革命: 11枚 / 通常",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
@@ -92,7 +100,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "half-7-1-c": RulePreset(
         key="half-7-1-c",
-        label="偶数半減: 7枚 / ペナ1 / 合成数あり",
+        label="7枚 / 偶数半減 / ペナ1",
         deck_rule=DeckRule.EVEN_HALVED,
         hand_size=7,
         penalty_rule=PenaltyRule.ALWAYS_1,
@@ -109,7 +117,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "tetrad-11-n-c": RulePreset(
         key="tetrad-11-n-c",
-        label="四つ子素数: 11枚 / 通常 / 合成数あり",
+        label="四つ子素数: 11枚 / 通常",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
@@ -127,7 +135,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "semiprime-11-n-c": RulePreset(
         key="semiprime-11-n-c",
-        label="半素数: 11枚 / 通常 / 合成数あり",
+        label="半素数: 11枚 / 通常",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
@@ -136,7 +144,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "registered-11-n": RulePreset(
         key="registered-11-n",
-        label="登録素数・合成数: 11枚 / 通常 / アシストなし",
+        label="登録制限: 11枚 / 通常 / アシストなし",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
@@ -146,7 +154,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "registered-11-n-assist": RulePreset(
         key="registered-11-n-assist",
-        label="登録素数・合成数: 11枚 / 通常 / アシストあり",
+        label="登録制限: 11枚 / 通常 / アシストあり",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
@@ -157,7 +165,7 @@ PRESETS: Dict[str, RulePreset] = {
     ),
     "neo-assist-11-n-unlimited": RulePreset(
         key="neo-assist-11-n-unlimited",
-        label="素数: 11枚 / 通常 / 登録アシストあり / 制限なし",
+        label="登録アシスト: 11枚 / 通常 / 制限なし",
         deck_rule=DeckRule.DEFAULT,
         hand_size=11,
         penalty_rule=PenaltyRule.NORMAL,
