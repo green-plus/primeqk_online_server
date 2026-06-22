@@ -753,15 +753,18 @@ def find_prime_realization(
 
 def assist_card_text(cards: List[dict], assigned_numbers: List[str]) -> str:
     parts = []
+    suffixes = []
     joker_index = 0
     for card in cards:
         if card.get("is_joker") or card.get("suit") == "X":
             assigned = assigned_numbers[joker_index] if joker_index < len(assigned_numbers) else "?"
-            parts.append(f"X={score_value_symbol(assigned)}")
+            parts.append("X")
+            if assigned != "inf":
+                suffixes.append(f"|X={score_value_symbol(assigned)}")
             joker_index += 1
         else:
             parts.append(score_value_symbol(card.get("rank")))
-    return "".join(parts)
+    return "".join(parts) + "".join(suffixes)
 
 def find_prime_realizations(
     number: int,
