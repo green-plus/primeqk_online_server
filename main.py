@@ -19,6 +19,18 @@ SERVER_DIR = Path(__file__).resolve().parent
 SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
 app = FastAPI()
 
+ASSIST_LIMITS = {
+    "ten": 10,
+    "fifty": 50,
+    "many": 50,
+}
+ASSIST_SCAN_LIMITS = {
+    "ten": 500,
+    "fifty": 2000,
+    "many": 2000,
+}
+ASSIST_REALIZATIONS_PER_NUMBER = 4
+
 ################################################
 # 素数判定
 ################################################
@@ -218,9 +230,10 @@ def rule_display_name(prime_rule: PrimeRule) -> str:
 ################################################
 
 class Room:
-    def __init__(self, room_id: str, rule: RulePreset):
+    def __init__(self, room_id: str, rule: RulePreset, category: str = "Classic"):
         self.room_id = room_id
         self.rule: RulePreset = rule
+        self.category = category
         self.players = []    # Playerオブジェクトのリスト
         self.state = "waiting"
         self.deck = []
@@ -253,6 +266,7 @@ class Room:
             "type": "update_room_status",
             "room_id": self.room_id,
             "rule": self.rule.label,
+            "category": self.category,
             "allow_composite": self.rule.allow_composite,
             "prime_rule": self.rule.prime_rule.name.lower(),
             "assist_enabled": self.rule.assist_enabled,
@@ -283,6 +297,7 @@ class Room:
             "type": "game_update",
             "room_id": self.room_id,
             "state": self.state,
+            "category": self.category,
             "current_turn": current_name,
             "revolution": self.reverse_order,
             "allow_composite": self.rule.allow_composite,
@@ -322,20 +337,20 @@ class Room:
 
 # アプリケーションの初期化時にRoomインスタンスを必要な数だけ作成しておく
 ROOM_CONFIG = [
-    ("room_1", PRESETS["std-5-1"]),
-    ("room_2", PRESETS["half-7-1-c"]),
-    ("room_3", PRESETS["std-7-1"]),
-    ("room_4", PRESETS["std-11-f-c"]),
-    ("room_5", PRESETS["std-11-n-c"]),
-    ("room_6", PRESETS["std-11-n-no-c"]),
-    ("room_7", PRESETS["std-11-n-c-rev"]),
-    ("room_8", PRESETS["tetrad-11-n-c"]),
-    ("room_9", PRESETS["semiprime-11-n-c"]),
-    ("room_13", PRESETS["registered-11-n"]),
-    ("room_14", PRESETS["registered-11-n-assist"]),
-    ("room_15", PRESETS["neo-assist-11-n-unlimited"]),
+    ("room_1", PRESETS["std-5-1"], "Classic"),
+    ("room_2", PRESETS["half-7-1-c"], "Classic"),
+    ("room_3", PRESETS["std-7-1"], "Classic"),
+    ("room_4", PRESETS["std-11-f-c"], "Classic"),
+    ("room_5", PRESETS["std-11-n-c"], "Classic"),
+    ("room_6", PRESETS["std-11-n-no-c"], "Classic"),
+    ("room_7", PRESETS["std-11-n-c-rev"], "Plus"),
+    ("room_8", PRESETS["tetrad-11-n-c"], "Plus"),
+    ("room_9", PRESETS["semiprime-11-n-c"], "Plus"),
+    ("room_13", PRESETS["registered-11-n"], "Neo"),
+    ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
+    ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
 ]
-rooms = {rid: Room(rid, rule) for rid, rule in ROOM_CONFIG}
+rooms = {rid: Room(rid, rule, category) for rid, rule, category in ROOM_CONFIG}
 
 class Player:
     def __init__(self, ws: WebSocket):
@@ -728,15 +743,74 @@ def find_prime_realization(
     source_cards: List[dict],
     required_card_count: Optional[int] = None,
 ) -> Optional[dict]:
+    realizations = find_prime_realizations(
+        number,
+        source_cards,
+        required_card_count,
+        limit=1,
+    )
+    return realizations[0] if realizations else None
+
+def assist_card_text(cards: List[dict], assigned_numbers: List[str]) -> str:
+    parts = []
+    joker_index = 0
+    for card in cards:
+        if card.get("is_joker") or card.get("suit") == "X":
+            assigned = assigned_numbers[joker_index] if joker_index < len(assigned_numbers) else "?"
+            parts.append(f"X={score_value_symbol(assigned)}")
+            joker_index += 1
+        else:
+            parts.append(score_value_symbol(card.get("rank")))
+    return "".join(parts)
+
+def find_prime_realizations(
+    number: int,
+    source_cards: List[dict],
+    required_card_count: Optional[int] = None,
+    limit: int = ASSIST_REALIZATIONS_PER_NUMBER,
+) -> List[dict]:
     text = str(number)
     used: list[dict] = []
     assigned_by_card_id: dict[str, str] = {}
+    results: list[dict] = []
+    seen_patterns: set[tuple[str, ...]] = set()
 
-    def visit(index: int, remaining: list[dict]) -> bool:
+    def card_pattern() -> tuple[str, ...]:
+        pattern = []
+        for card in used:
+            if card.get("is_joker") or card.get("suit") == "X":
+                pattern.append(f"X={assigned_by_card_id.get(card['card_id'], '?')}")
+            else:
+                pattern.append(str(card.get("rank")))
+        return tuple(pattern)
+
+    def collect_result() -> None:
+        pattern = card_pattern()
+        if pattern in seen_patterns:
+            return
+        seen_patterns.add(pattern)
+        assigned_numbers = [
+            assigned_by_card_id[card["card_id"]]
+            for card in used
+            if card.get("is_joker") or card.get("suit") == "X"
+        ]
+        cards = used[:]
+        results.append({
+            "number": number,
+            "cards": cards,
+            "assigned_numbers": assigned_numbers,
+            "visible_text": assist_card_text(cards, assigned_numbers),
+        })
+
+    def visit(index: int, remaining: list[dict]) -> None:
+        if len(results) >= limit:
+            return
         if required_card_count is not None and len(used) > required_card_count:
-            return False
+            return
         if index == len(text):
-            return required_card_count is None or len(used) == required_card_count
+            if required_card_count is None or len(used) == required_card_count:
+                collect_result()
+            return
 
         for i, card in enumerate(remaining):
             options: list[str]
@@ -752,26 +826,16 @@ def find_prime_realization(
                 if card.get("is_joker") or card.get("suit") == "X":
                     assigned_by_card_id[card["card_id"]] = option
                 next_remaining = remaining[:i] + remaining[i + 1:]
-                if visit(index + len(option), next_remaining):
-                    return True
+                visit(index + len(option), next_remaining)
                 if card.get("is_joker") or card.get("suit") == "X":
                     assigned_by_card_id.pop(card["card_id"], None)
                 used.pop()
-        return False
+                if len(results) >= limit:
+                    return
 
-    if not visit(0, source_cards[:]):
-        return None
-
-    assigned_numbers = [
-        assigned_by_card_id[card["card_id"]]
-        for card in used
-        if card.get("is_joker") or card.get("suit") == "X"
-    ]
-    return {
-        "number": number,
-        "cards": used[:],
-        "assigned_numbers": assigned_numbers,
-    }
+    visit(0, source_cards[:])
+    results.sort(key=lambda result: (len(result["cards"]), result["visible_text"]))
+    return results
 
 def remove_cards_by_id(cards: List[dict], used_cards: List[dict]) -> List[dict]:
     used_ids = {card["card_id"] for card in used_cards}
@@ -853,13 +917,21 @@ def assist_limit_from_filters(data: dict) -> int:
     filters = data.get("filters") or {}
     if not isinstance(filters, dict):
         filters = {}
-    if filters.get("limit_mode") == "ten":
-        return 10
-    limit = data.get("limit", 100)
+    limit_mode = filters.get("limit_mode", "ten")
+    if limit_mode in ASSIST_LIMITS:
+        return ASSIST_LIMITS[limit_mode]
+    limit = data.get("limit", 10)
     try:
-        return max(1, min(int(limit), 200))
+        return max(1, min(int(limit), 50))
     except (TypeError, ValueError):
-        return 100
+        return 10
+
+def assist_scan_limit_from_filters(data: dict) -> int:
+    filters = data.get("filters") or {}
+    if not isinstance(filters, dict):
+        filters = {}
+    limit_mode = filters.get("limit_mode", "ten")
+    return ASSIST_SCAN_LIMITS.get(limit_mode, ASSIST_SCAN_LIMITS["ten"])
 
 def assist_filter_value(data: dict, key: str, default: str) -> str:
     filters = data.get("filters") or {}
@@ -874,6 +946,35 @@ def assist_number_sort_key(room: Room, order: str):
         return (lambda item: item[1]) if strong_first else (lambda item: -item[1])
     return (lambda item: -item[1]) if strong_first else (lambda item: item[1])
 
+def assist_efficiency_score(candidate: dict) -> float:
+    card_count = max(1, len(candidate.get("cards") or []))
+    return candidate["number"] / (10 ** (card_count - 1))
+
+def finalize_assist_candidates(
+    candidates: list[dict],
+    limit: int,
+    source: str,
+    truncated: bool,
+    scan_limit: Optional[int] = None,
+    order: str = "weak",
+) -> dict:
+    if order == "efficient":
+        candidates = sorted(
+            candidates,
+            key=lambda candidate: (
+                -assist_efficiency_score(candidate),
+                -candidate["number"],
+                len(candidate.get("cards") or []),
+                candidate.get("visible_text", ""),
+            ),
+        )
+        truncated = truncated or len(candidates) > limit
+        candidates = candidates[:limit]
+    payload = {"candidates": candidates, "truncated": truncated, "source": source}
+    if scan_limit is not None:
+        payload["scan_limit"] = scan_limit
+    return payload
+
 def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> dict:
     if (
         not room.rule.registration_enabled
@@ -886,21 +987,34 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
         selected_ids = []
 
     hand_by_id = {card["card_id"]: card for card in player.hand}
-    source_cards = [hand_by_id[cid] for cid in selected_ids if cid in hand_by_id]
-    source = "selected" if source_cards else "hand"
-    if not source_cards:
+    selected_id_set = {cid for cid in selected_ids if cid in hand_by_id}
+    target_scope = assist_filter_value(data, "target_scope", "auto")
+    if target_scope == "selected":
+        source_cards = [hand_by_id[cid] for cid in selected_ids if cid in hand_by_id]
+        source = "selected"
+    elif target_scope == "unselected":
+        source_cards = [card for card in player.hand if card["card_id"] not in selected_id_set]
+        source = "unselected"
+    else:
+        source_cards = [hand_by_id[cid] for cid in selected_ids if cid in hand_by_id]
+        source = "selected" if source_cards else "unselected"
+    if not source_cards and source != "selected":
         source_cards = player.hand[:]
+        source = "unselected"
 
     count_scope = assist_filter_value(data, "count_scope", "field")
     order = assist_filter_value(data, "order", "weak")
+    defer_limit_until_sorted = order == "efficient"
     required_card_count = (
         len(room.field)
         if room.field and count_scope != "all"
         else None
     )
     limit = assist_limit_from_filters(data)
+    scan_limit = assist_scan_limit_from_filters(data)
 
     candidates = []
+    scanned = 0
     registered_numbers = [("prime", number, None) for number in player.registered_primes]
     if room.rule.allow_composite:
         registered_numbers.extend(
@@ -911,32 +1025,74 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     registered_numbers.sort(key=assist_number_sort_key(room, order))
 
     for kind, number, entry in registered_numbers:
+        scanned += 1
+        if scanned > scan_limit:
+            return finalize_assist_candidates(
+                candidates,
+                limit,
+                source,
+                truncated=True,
+                scan_limit=scan_limit,
+                order=order,
+            )
         if not field_allows_number_value(room, number):
             continue
-        realization = find_prime_realization(number, source_cards, required_card_count)
-        if realization is None:
-            continue
-        if (
-            count_scope != "all"
-            and not field_allows_number(room, number, len(realization["cards"]))
-        ):
-            continue
-        realization["kind"] = kind
-        realization["field_count_match"] = (
-            not room.field or len(realization["cards"]) == len(room.field)
+        realizations = find_prime_realizations(
+            number,
+            source_cards,
+            required_card_count,
+            limit=ASSIST_REALIZATIONS_PER_NUMBER,
         )
-        if kind == "composite":
-            material_source = remove_cards_by_id(player.hand, realization["cards"])
+        for realization in realizations:
+            if (
+                count_scope != "all"
+                and not field_allows_number(room, number, len(realization["cards"]))
+            ):
+                continue
+            realization["kind"] = kind
+            realization["field_count_match"] = (
+                not room.field or len(realization["cards"]) == len(room.field)
+            )
+            if kind != "composite":
+                candidates.append(realization)
+                if not defer_limit_until_sorted and len(candidates) >= limit:
+                    return finalize_assist_candidates(
+                        candidates,
+                        limit,
+                        source,
+                        truncated=True,
+                        order=order,
+                    )
+                continue
+
+            material_pool = source_cards if source in ("selected", "unselected") else player.hand
+            material_source = remove_cards_by_id(material_pool, realization["cards"])
             expression = find_composite_expression_realization(entry, material_source)
             if expression is None:
                 continue
             realization["expression"] = entry.expression
             realization["composite"] = expression
-        candidates.append(realization)
-        if len(candidates) >= limit:
-            return {"candidates": candidates, "truncated": True, "source": source}
+            realization["material_text"] = assist_card_text(
+                expression["cards"],
+                expression["assigned_numbers"],
+            )
+            candidates.append(realization)
+            if not defer_limit_until_sorted and len(candidates) >= limit:
+                return finalize_assist_candidates(
+                    candidates,
+                    limit,
+                    source,
+                    truncated=True,
+                    order=order,
+                )
 
-    return {"candidates": candidates, "truncated": False, "source": source}
+    return finalize_assist_candidates(
+        candidates,
+        limit,
+        source,
+        truncated=False,
+        order=order,
+    )
 ################################################
 # Webhook
 ################################################
@@ -1025,6 +1181,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "get_room_counts":
                 counts = {room_id: len(room.players) for room_id, room in rooms.items()}
                 rules  = {rid: room.rule.label for rid, room in rooms.items()}
+                room_categories = {rid: room.category for rid, room in rooms.items()}
                 allow_composite = {rid: room.rule.allow_composite for rid, room in rooms.items()}
                 prime_rules = {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()}
                 assist_enabled = {rid: room.rule.assist_enabled for rid, room in rooms.items()}
@@ -1033,6 +1190,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "type": "room_counts",
                     "counts": counts,
                     "rules": rules,
+                    "room_categories": room_categories,
                     "allow_composite": allow_composite,
                     "prime_rules": prime_rules,
                     "assist_enabled": assist_enabled,
@@ -1051,6 +1209,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await player.send_json({
                         "type": "room_state_initialization",
                         "room_state": room.state,
+                        "category": room.category,
                         "allow_composite": room.rule.allow_composite,
                         "prime_rule": room.rule.prime_rule.name.lower(),
                         "assist_enabled": room.rule.assist_enabled,
@@ -1080,6 +1239,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await room.broadcast({
                     "type": "room_state_initialization",
                     "room_state": room.state,
+                    "category": room.category,
                     "allow_composite": room.rule.allow_composite,
                     "prime_rule": room.rule.prime_rule.name.lower(),
                     "assist_enabled": room.rule.assist_enabled,
@@ -1866,6 +2026,7 @@ async def start_game(room):
     # 全体にゲーム開始 & 現在のターン情報
     await room.broadcast({
         "type": "game_start",
+        "category": room.category,
         "allow_composite": room.rule.allow_composite,
         "prime_rule": room.rule.prime_rule.name.lower(),
         "assist_enabled": room.rule.assist_enabled,
