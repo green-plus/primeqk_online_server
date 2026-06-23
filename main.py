@@ -1110,7 +1110,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     registered_numbers.sort(key=assist_number_sort_key(room, order))
 
     for kind, number, entry in registered_numbers:
-        if not field_allows_number_value(room, number):
+        if count_scope != "all" and not field_allows_number_value(room, number):
             continue
         if not can_realize_number_text(number):
             continue
@@ -1139,7 +1139,9 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
                 continue
             realization["kind"] = kind
             realization["field_count_match"] = (
-                not room.field or len(realization["cards"]) == len(room.field)
+                count_scope == "all"
+                or not room.field
+                or len(realization["cards"]) == len(room.field)
             )
             if kind != "composite":
                 candidates.append(realization)
