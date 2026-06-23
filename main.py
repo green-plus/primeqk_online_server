@@ -518,6 +518,22 @@ def record_score_line(room: Room, line: str) -> None:
         "line": line,
     })
 
+def record_score_play_line(room: Room, player: "Player", notation: str) -> None:
+    prefix = f"{player.name}:"
+    if room.score_log:
+        last = room.score_log[-1]
+        line = last.get("line", "")
+        if line.startswith(prefix):
+            tail = line[len(prefix):]
+            if "D(" in tail and tail.endswith(")") and ",P(" not in tail:
+                draw_prefix = tail.split("D(", 1)[0]
+                suffix = notation
+                if draw_prefix and suffix.startswith(draw_prefix):
+                    suffix = suffix[len(draw_prefix):]
+                last["line"] = line + suffix
+                return
+    record_score_line(room, f"{player.name}:{notation}")
+
 def record_score_event(room: Room, player: "Player", notation: str, result: str) -> None:
     line = f"{player.name}:{notation}"
     room.score_log.append({
@@ -1498,10 +1514,12 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         room.has_drawn = False
         await player.send_hand_update()
         await room.log_chat(f"{player.name}がジョーカーを出しました、インフィニティ！")
-        record_score_line(room, f"{player.name}:{score_prefix}X[IN]{score_win_suffix(player)}")
+        record_score_play_line(room, player, f"{score_prefix}X[IN]{score_win_suffix(player)}")
         await room.update_game_state()
         if await room.try_end_game():
             await room.update_room_status()
+        else:
+            await broadcast_turn_update(room, player.name)
         return  # ターン継続
     # ２）ジョーカーを含む複数枚プレイ時は、置換して number を作成
     if jokers:
@@ -1582,11 +1600,12 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         await player.send_hand_update()
         await room.log_chat(f"{player.name}が57を出しました、グロタンカット！")
         play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
-        record_score_line(room, f"{player.name}:{score_prefix}{play_text}[GC]{score_win_suffix(player)}")
+        record_score_play_line(room, player, f"{score_prefix}{play_text}[GC]{score_win_suffix(player)}")
         await room.update_game_state()
         if await room.try_end_game():
             await room.update_room_status()
             return
+        await broadcast_turn_update(room, player.name)
         return  # 次の処理（素数判定～next_turn）をすべてスキップ
     if number == 1729:
         # フラグをトグル
@@ -1604,7 +1623,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         # ログ
         await room.log_chat(f"{player.name}が1729を出しました、ラマヌジャン革命！")
         play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
-        record_score_line(room, f"{player.name}:{score_prefix}{play_text}[RR]{score_win_suffix(player)}")
+        record_score_play_line(room, player, f"{score_prefix}{play_text}[RR]{score_win_suffix(player)}")
 
         # 通常の素数出しと同じく次のターンへ
         await next_turn(room)
@@ -1641,9 +1660,10 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
         rule_name = rule_display_name(room.rule.prime_rule)
         await room.log_chat(f"{player.name}が{number}を出そうとしましたが、{number}は{rule_name}ではありません")
         play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
-        record_score_line(
+        record_score_play_line(
             room,
-            f"{player.name}:{score_prefix}{play_text},P({score_cards_text(drawn_penalties, sort_cards=True)})"
+            player,
+            f"{score_prefix}{play_text},P({score_cards_text(drawn_penalties, sort_cards=True)})"
         )
 
         await next_turn(room)
@@ -1670,7 +1690,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     # チャットに「素数を出した」ログを流す
     await room.log_chat(f"{player.name}が{number}を出しました")
     play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
-    record_score_line(room, f"{player.name}:{score_prefix}{play_text}{score_win_suffix(player)}")
+    record_score_play_line(room, player, f"{score_prefix}{play_text}{score_win_suffix(player)}")
     await next_turn(room)
 
 # 現行ルールでは指数が122を超える合法手が存在しないため、
@@ -1877,6 +1897,10 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         f"{score_cards_text(sel_cards)}={score_tokens_text(comp_tokens, score_cards_by_id)}"
         f"{score_joker_suffix(sel_cards + con_cards, sel_assigned + comp_assigned)}"
     )
+    composite_chat_text = (
+        f"{score_cards_text(sel_cards)}={score_tokens_text(comp_tokens, score_cards_by_id).replace('*', '×')}"
+        f"{score_joker_suffix(con_cards, comp_assigned)}"
+    )
 
     # 手札に全部あるか
     all_consume = list({c["card_id"]:c for c in (sel_cards + con_cards)}.values())
@@ -1984,10 +2008,11 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
             "played_cards": sel_cards,
             "number": sel_number
         })
-        await room.log_chat(f"{player.name}の合成数は不正でした（{e.msg}）。ペナルティ。")
-        record_score_line(
+        await room.log_chat(f"{player.name}の合成数 {composite_chat_text} は不正でした（{e.msg}）。ペナルティ。")
+        record_score_play_line(
             room,
-            f"{player.name}:{score_prefix}{score_composite_text},P({score_cards_text(drawn_penalties, sort_cards=True)})"
+            player,
+            f"{score_prefix}{score_composite_text},P({score_cards_text(drawn_penalties, sort_cards=True)})"
         )
         await next_turn(room)
         return
@@ -2020,8 +2045,8 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         "number": sel_number,
         "mode": "composite"
     })
-    await room.log_chat(f"{player.name}が合成数 {sel_number} を出しました")
-    record_score_line(room, f"{player.name}:{score_prefix}{score_composite_text}{score_win_suffix(player)}")
+    await room.log_chat(f"{player.name}が{composite_chat_text}を出しました")
+    record_score_play_line(room, player, f"{score_prefix}{score_composite_text}{score_win_suffix(player)}")
     await next_turn(room)
 
 
@@ -2130,6 +2155,13 @@ async def start_game(room):
 ################################################
 # 次のターンに移る
 ################################################
+async def broadcast_turn_update(room, current_turn_name: str | None, reset_timer: bool = True) -> None:
+    await room.broadcast({
+        "type": "turn_update",
+        "current_turn": current_turn_name,
+        "reset_timer": reset_timer,
+    })
+
 async def next_turn(room):
     # ターンが変わるので、ドロー済みフラグをリセットする
     room.has_drawn = False
@@ -2158,7 +2190,4 @@ async def next_turn(room):
     # await room.update_game_state() それぞれのアクションで既に呼び出されているので省略
     # 次のプレイヤー名を取得して送信
     next_player = next((p for p in room.players if p.id == room.current_turn_id), None)
-    await room.broadcast({
-        "type": "next_turn",
-        "current_turn": next_player.name if next_player else None,
-    })
+    await broadcast_turn_update(room, next_player.name if next_player else None)
