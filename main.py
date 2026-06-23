@@ -1,6 +1,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from dataclasses import asdict
 from pathlib import Path
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule
 from registered_primes import parse_registered_composite_text, parse_registered_prime_text
@@ -766,6 +767,73 @@ def assist_card_text(cards: List[dict], assigned_numbers: List[str]) -> str:
             parts.append(score_value_symbol(card.get("rank")))
     return "".join(parts) + "".join(suffixes)
 
+def assist_joker_count(cards: List[dict]) -> int:
+    return sum(1 for card in cards if card.get("is_joker") or card.get("suit") == "X")
+
+def build_assist_number_text_filter(
+    source_cards: List[dict],
+    required_card_count: Optional[int],
+):
+    rank_counts = [0] * 14
+    joker_count = 0
+    for card in source_cards:
+        if card.get("is_joker") or card.get("suit") == "X":
+            joker_count += 1
+            continue
+        try:
+            rank = int(card.get("rank"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= rank <= 13:
+            rank_counts[rank] += 1
+
+    rank_options = tuple(
+        (str(rank), rank)
+        for rank, count in enumerate(rank_counts)
+        if count > 0
+    )
+    joker_options = tuple(str(value) for value in range(14))
+    total_cards = len(source_cards)
+
+    @lru_cache(maxsize=None)
+    def can_match(text: str, index: int, counts: tuple[int, ...], jokers_left: int, used_count: int) -> bool:
+        if required_card_count is not None:
+            if used_count > required_card_count:
+                return False
+            if used_count + (len(text) - index) < required_card_count:
+                return False
+            if used_count + (total_cards - used_count) < required_card_count:
+                return False
+        if index == len(text):
+            return required_card_count is None or used_count == required_card_count
+
+        for option, rank in rank_options:
+            if counts[rank] <= 0 or not text.startswith(option, index):
+                continue
+            next_counts = list(counts)
+            next_counts[rank] -= 1
+            if can_match(text, index + len(option), tuple(next_counts), jokers_left, used_count + 1):
+                return True
+
+        if jokers_left > 0:
+            for option in joker_options:
+                if text.startswith(option, index) and can_match(
+                    text,
+                    index + len(option),
+                    counts,
+                    jokers_left - 1,
+                    used_count + 1,
+                ):
+                    return True
+
+        return False
+
+    def can_realize(number: int) -> bool:
+        text = str(number)
+        return can_match(text, 0, tuple(rank_counts), joker_count, 0)
+
+    return can_realize
+
 def find_prime_realizations(
     number: int,
     source_cards: List[dict],
@@ -803,6 +871,7 @@ def find_prime_realizations(
             "cards": cards,
             "assigned_numbers": assigned_numbers,
             "visible_text": assist_card_text(cards, assigned_numbers),
+            "joker_count": assist_joker_count(cards),
         })
 
     def visit(index: int, remaining: list[dict]) -> None:
@@ -815,7 +884,11 @@ def find_prime_realizations(
                 collect_result()
             return
 
-        for i, card in enumerate(remaining):
+        candidates = sorted(
+            enumerate(remaining),
+            key=lambda item: 1 if item[1].get("is_joker") or item[1].get("suit") == "X" else 0,
+        )
+        for i, card in candidates:
             options: list[str]
             if card.get("is_joker") or card.get("suit") == "X":
                 options = [str(v) for v in range(14)]
@@ -837,7 +910,11 @@ def find_prime_realizations(
                     return
 
     visit(0, source_cards[:])
-    results.sort(key=lambda result: (len(result["cards"]), result["visible_text"]))
+    results.sort(key=lambda result: (
+        len(result["cards"]),
+        result.get("joker_count", 0),
+        result["visible_text"],
+    ))
     return results
 
 def remove_cards_by_id(cards: List[dict], used_cards: List[dict]) -> List[dict]:
@@ -968,6 +1045,7 @@ def finalize_assist_candidates(
                 -assist_efficiency_score(candidate),
                 -candidate["number"],
                 len(candidate.get("cards") or []),
+                candidate.get("joker_count", 0),
                 candidate.get("visible_text", ""),
             ),
         )
@@ -998,6 +1076,9 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     elif target_scope == "unselected":
         source_cards = [card for card in player.hand if card["card_id"] not in selected_id_set]
         source = "unselected"
+    elif target_scope == "all":
+        source_cards = player.hand[:]
+        source = "all"
     else:
         source_cards = [hand_by_id[cid] for cid in selected_ids if cid in hand_by_id]
         source = "selected" if source_cards else "unselected"
@@ -1015,6 +1096,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     )
     limit = assist_limit_from_filters(data)
     scan_limit = assist_scan_limit_from_filters(data)
+    can_realize_number_text = build_assist_number_text_filter(source_cards, required_card_count)
 
     candidates = []
     scanned = 0
@@ -1028,6 +1110,11 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     registered_numbers.sort(key=assist_number_sort_key(room, order))
 
     for kind, number, entry in registered_numbers:
+        if not field_allows_number_value(room, number):
+            continue
+        if not can_realize_number_text(number):
+            continue
+
         scanned += 1
         if scanned > scan_limit:
             return finalize_assist_candidates(
@@ -1038,8 +1125,6 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
                 scan_limit=scan_limit,
                 order=order,
             )
-        if not field_allows_number_value(room, number):
-            continue
         realizations = find_prime_realizations(
             number,
             source_cards,
@@ -1068,7 +1153,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
                     )
                 continue
 
-            material_pool = source_cards if source in ("selected", "unselected") else player.hand
+            material_pool = source_cards if source in ("selected", "unselected", "all") else player.hand
             material_source = remove_cards_by_id(material_pool, realization["cards"])
             expression = find_composite_expression_realization(entry, material_source)
             if expression is None:
@@ -1239,7 +1324,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 player.status = "watching"  # 仮に入室したらwatchingに
 
                 await room.update_room_status()
-                await room.broadcast({
+                await player.send_json({
                     "type": "room_state_initialization",
                     "room_state": room.state,
                     "category": room.category,
