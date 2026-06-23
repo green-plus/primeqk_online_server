@@ -351,6 +351,17 @@ ROOM_CONFIG = [
     ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
 ]
+ROOM_DESCRIPTIONS = {
+    "room_15": (
+        "登録した素数・合成数をもとにアシスト候補を表示する部屋です。"
+        "登録リストによる使用制限はないため、登録していない素数も通常通り出せます。\n"
+        "素数候補欄では、検索対象を手札全体・選択中・未選択から切り替えられます。"
+        "候補数、強い順/弱い順/効率順、出せる数/全枚数/枚数指定も変更できます。\n"
+        "候補ボタンを押すと、出す予定のカードが自動で並びます。"
+        "合成数候補では、式に使う材料札もあわせてセットされます。"
+        "ジョーカーを含む候補は X69|X=2 のような数譜方式で表示されます。"
+    ),
+}
 rooms = {rid: Room(rid, rule, category) for rid, rule, category in ROOM_CONFIG}
 
 class Player:
@@ -663,6 +674,8 @@ def missing_registered_prime_players(room: Room) -> List["Player"]:
 def registered_numbers_update_payload(prime_result, composite_result) -> dict:
     return {
         "type": "registered_numbers_updated",
+        "prime_values": sorted(set(prime_result.prime_values)),
+        "composite_values": sorted(set(composite_result.composite_values)),
         "prime_count": len(prime_result.prime_values),
         "composite_count": len(composite_result.composite_values),
         "prime_duplicate_count": prime_result.duplicate_count,
@@ -729,6 +742,8 @@ def load_sample_registered_prime_payload(player: "Player") -> dict:
     )
     return {
         "type": "registered_numbers_updated",
+        "prime_values": sorted(player.registered_primes),
+        "composite_values": sorted(player.registered_composites),
         "prime_count": len(player.registered_primes),
         "composite_count": len(player.registered_composites),
         "prime_duplicate_count": 0,
@@ -1036,6 +1051,14 @@ def assist_filter_value(data: dict, key: str, default: str) -> str:
     value = filters.get(key)
     return value if isinstance(value, str) else default
 
+def assist_card_count_from_filters(data: dict) -> Optional[int]:
+    value = assist_filter_value(data, "card_count", "1")
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return count if 1 <= count <= 11 else 1
+
 def assist_number_sort_key(room: Room, order: str):
     strong_first = order == "strong"
     if room.reverse_order:
@@ -1105,11 +1128,13 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     count_scope = assist_filter_value(data, "count_scope", "field")
     order = assist_filter_value(data, "order", "weak")
     defer_limit_until_sorted = order == "efficient"
-    required_card_count = (
-        len(room.field)
-        if room.field and count_scope != "all"
-        else None
-    )
+    specified_card_count = assist_card_count_from_filters(data) if count_scope == "specified" else None
+    required_card_count = None
+    if room.field and count_scope == "field":
+        required_card_count = len(room.field)
+    elif count_scope == "specified":
+        required_card_count = specified_card_count
+    apply_field_value_filter = count_scope == "field"
     limit = assist_limit_from_filters(data)
     scan_limit = assist_scan_limit_from_filters(data)
     can_realize_number_text = build_assist_number_text_filter(source_cards, required_card_count)
@@ -1126,7 +1151,7 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
     registered_numbers.sort(key=assist_number_sort_key(room, order))
 
     for kind, number, entry in registered_numbers:
-        if count_scope != "all" and not field_allows_number_value(room, number):
+        if apply_field_value_filter and not field_allows_number_value(room, number):
             continue
         if not can_realize_number_text(number):
             continue
@@ -1149,13 +1174,13 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
         )
         for realization in realizations:
             if (
-                count_scope != "all"
+                apply_field_value_filter
                 and not field_allows_number(room, number, len(realization["cards"]))
             ):
                 continue
             realization["kind"] = kind
             realization["field_count_match"] = (
-                count_scope == "all"
+                count_scope == "specified"
                 or not room.field
                 or len(realization["cards"]) == len(room.field)
             )
@@ -1292,6 +1317,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 prime_rules = {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()}
                 assist_enabled = {rid: room.rule.assist_enabled for rid, room in rooms.items()}
                 registration_enabled = {rid: room.rule.registration_enabled for rid, room in rooms.items()}
+                room_descriptions = {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in rooms}
                 await websocket.send_json({
                     "type": "room_counts",
                     "counts": counts,
@@ -1301,6 +1327,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "prime_rules": prime_rules,
                     "assist_enabled": assist_enabled,
                     "registration_enabled": registration_enabled,
+                    "room_descriptions": room_descriptions,
                 })
 
             elif msg_type == "join_room":
@@ -1320,6 +1347,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "prime_rule": room.rule.prime_rule.name.lower(),
                         "assist_enabled": room.rule.assist_enabled,
                         "registration_enabled": room.rule.registration_enabled,
+                        "description": ROOM_DESCRIPTIONS.get(room.room_id, ""),
                     })
                     continue
 
@@ -1350,6 +1378,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "prime_rule": room.rule.prime_rule.name.lower(),
                     "assist_enabled": room.rule.assist_enabled,
                     "registration_enabled": room.rule.registration_enabled,
+                    "description": ROOM_DESCRIPTIONS.get(room.room_id, ""),
                 })
 
             elif msg_type == "leave_room":
@@ -1495,6 +1524,9 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     # 既存の "cards" + "assigned_numbers" で連結 → 特別数(57,1729) → 素数チェック
     played_cards = data.get("cards", [])
     score_prefix = score_state_prefix(room)
+    if not played_cards:
+        await player.ws.send_json({"type": "error", "message": "出すカードを選んでください。"})
+        return
     # 手札にあるか検証
     if not player.has_cards(played_cards):
         await player.ws.send_json({"type": "error", "message": "そのカードは手札にありません。"})
@@ -1885,6 +1917,12 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
     sel_assigned: List[str] = selected.get("assigned_numbers", [])
     comp_assigned: List[str] = comp.get("assigned_numbers", [])
     score_prefix = score_state_prefix(room)
+    if not sel_cards:
+        await player.ws.send_json({"type": "error", "message": "見せ札を選んでください。"})
+        return
+    if not comp_tokens:
+        await player.ws.send_json({"type": "error", "message": "材料札で合成数の式を作ってください。"})
+        return
 
     # composite.tokens から材料札を再構成（見せ札と材料札は常に別）
     token_card_ids = [t.get("card_id") for t in comp_tokens if t.get("kind") == "card"]
