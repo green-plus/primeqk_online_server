@@ -5,6 +5,7 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule
 from registered_primes import parse_registered_composite_text, parse_registered_prime_text
+from cpu_player import CpuPlayer, choose_cpu_action, is_cpu_player
 import json
 import random
 from random import randrange
@@ -278,6 +279,7 @@ class Room:
                     "id": p.id,
                     "name": p.name,
                     "status": p.status,
+                    "is_cpu": is_cpu_player(p),
                     "registered_prime_count": len(p.registered_primes),
                     "registered_composite_count": len(p.registered_composites),
                 }
@@ -312,6 +314,7 @@ class Room:
                     "id": p.id,
                     "name": p.name,
                     "status": p.status,
+                    "is_cpu": is_cpu_player(p),
                     "registered_prime_count": len(p.registered_primes),
                     "registered_composite_count": len(p.registered_composites),
                 }
@@ -1237,6 +1240,107 @@ async def notify_discord(content: str):
         print("notify_discord failed:", e)
 
 ################################################
+# CPU処理
+################################################
+
+def current_turn_player(room: Room):
+    return next((p for p in room.players if p.id == room.current_turn_id), None)
+
+
+async def add_cpu_to_room(room: Room, name: str = "CPU") -> CpuPlayer:
+    cpu_count = sum(1 for p in room.players if is_cpu_player(p))
+    cpu = CpuPlayer(name=f"{name}{cpu_count + 1}" if cpu_count else name)
+    cpu.room = room
+    cpu.status = "waiting"
+    if room.rule.registration_enabled and (SAMPLE_REGISTERED_PRIMES or SAMPLE_REGISTERED_COMPOSITES):
+        load_sample_registered_prime_payload(cpu)
+    room.players.append(cpu)
+    await room.log_chat(f"{cpu.name}が入室しました")
+    await room.update_room_status()
+    return cpu
+
+
+async def remove_cpu_from_room(room: Room) -> bool:
+    cpu = next((p for p in room.players if is_cpu_player(p)), None)
+    if cpu is None:
+        return False
+    room.players.remove(cpu)
+    cpu.room = None
+    cpu.status = "watching"
+    cpu.clear_hand()
+    await room.log_chat(f"{cpu.name}が退室しました")
+    await room.update_room_status()
+    return True
+
+
+async def maybe_schedule_cpu_turn(room: Room) -> None:
+    if room.state != "playing":
+        return
+    current = current_turn_player(room)
+    if not is_cpu_player(current):
+        return
+    if getattr(room, "cpu_turn_running", False):
+        return
+    room.cpu_turn_running = True
+    asyncio.create_task(run_cpu_turn(room, current))
+
+
+async def run_cpu_turn(room: Room, cpu: CpuPlayer) -> None:
+    try:
+        await asyncio.sleep(0.8)
+        if room.state != "playing" or room.current_turn_id != cpu.id or cpu not in room.players:
+            return
+
+        action = choose_cpu_action(cpu, room, validator=is_valid_prime_for_player)
+        if action.kind == "play_prime":
+            await handle_prime_play(cpu, room, action.payload)
+        elif action.kind == "draw":
+            await draw_card_for_player(cpu, room)
+            followup = choose_cpu_action(cpu, room, validator=is_valid_prime_for_player)
+            if followup.kind == "play_prime" and room.current_turn_id == cpu.id:
+                await asyncio.sleep(0.4)
+                await handle_prime_play(cpu, room, followup.payload)
+            elif room.current_turn_id == cpu.id:
+                await asyncio.sleep(0.4)
+                await pass_turn_for_player(cpu, room)
+        else:
+            await pass_turn_for_player(cpu, room)
+    finally:
+        room.cpu_turn_running = False
+        if room.state == "playing" and room.current_turn_id == cpu.id:
+            await maybe_schedule_cpu_turn(room)
+
+
+async def draw_card_for_player(player, room: Room) -> bool:
+    if room.has_drawn:
+        await player.send_json({"type": "error", "message": "このターンはすでにドロー済みです。"})
+        return False
+    if not room.deck:
+        return False
+
+    drawn = room.deck.pop(0)
+    player.add_card(drawn)
+    record_score_line(room, f"{player.name}:{score_state_prefix(room)}D({score_card_symbol(drawn)})")
+    await player.send_hand_update()
+    await room.update_game_state()
+    room.has_drawn = True
+    return True
+
+
+async def pass_turn_for_player(player, room: Room) -> None:
+    await player.send_hand_update()
+    flow_field(room)
+    await room.update_game_state()
+    await room.broadcast({
+        "type": "action_result",
+        "action": "pass",
+        "player_id": player.id
+    })
+    await room.log_chat(f"{player.name}がパスしました")
+    record_score_play_line(room, player, f"{score_state_prefix(room)}%")
+    await next_turn(room)
+
+################################################
 # WebSocket処理
 ################################################
 
@@ -1393,6 +1497,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 if room.state == "playing" and await room.try_end_game():
                     await room.update_room_status()
 
+            elif msg_type == "add_cpu":
+                if not player.room:
+                    continue
+                room = player.room
+                if room.state == "playing":
+                    await player.send_json({"type": "error", "message": "対戦中はCPUを追加できません。"})
+                    continue
+                if any(is_cpu_player(p) for p in room.players):
+                    await player.send_json({"type": "error", "message": "この部屋にはすでにCPUがいます。"})
+                    continue
+                if len(room.players) >= 10:
+                    await player.send_json({"type": "error", "message": "部屋が満員です。"})
+                    continue
+                await add_cpu_to_room(room)
+
+            elif msg_type == "remove_cpu":
+                if not player.room:
+                    continue
+                room = player.room
+                if room.state == "playing":
+                    await player.send_json({"type": "error", "message": "対戦中はCPUを退出させられません。"})
+                    continue
+                if not await remove_cpu_from_room(room):
+                    await player.send_json({"type": "error", "message": "この部屋にCPUはいません。"})
+                    continue
+
             elif msg_type == "start_game":
                 if not player.room:
                     continue
@@ -1413,6 +1543,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 await start_game(room)
+                await maybe_schedule_cpu_turn(room)
 
             elif msg_type == "get_prime_assist":
                 if not player.room:
@@ -1455,23 +1586,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "message": "あなたのターンではありません。"})
                     continue
 
-                # すでにこのターンでドローしているかチェック
-                if room.has_drawn == True:
-                    await websocket.send_json({"type": "error", "message": "このターンはすでにドロー済みです。"})
-                    continue
-
-                # ドロー処理
-                if len(room.deck) > 0:
-                    drawn = room.deck.pop(0)
-                    player.add_card(drawn)
-                    record_score_line(room, f"{player.name}:{score_state_prefix(room)}D({score_card_symbol(drawn)})")
-
-                    # 自分に手札更新を送る
-                    await player.send_hand_update()
-                    await room.update_game_state()
-                    # ドロー済みフラグを設定（このターンはこれ以上ドローできない）
-                    room.has_drawn = True
-                    # ※ここでは next_turn(room) は呼ばない → 手番は変わらない
+                await draw_card_for_player(player, room)
 
             elif msg_type == "pass":
                 if not player.room:
@@ -1481,23 +1596,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "message": "あなたのターンではありません。"})
                     continue
 
-                await player.send_hand_update()
-
-                # パスの場合もフィールドをリセット
-                flow_field(room)
-
-                # passの通知
-                await room.update_game_state()
-                await room.broadcast({
-                    "type": "action_result",
-                    "action": "pass",
-                    "player_id": player.id
-                })
-                # チャットにパスのログを流す
-                await room.log_chat(f"{player.name}がパスしました")
-                record_score_play_line(room, player, f"{score_state_prefix(room)}%")
-                # 次のターンへ
-                await next_turn(room)
+                await pass_turn_for_player(player, room)
 
             elif msg_type == "chat":
                 if not player.room:
@@ -2172,7 +2271,7 @@ async def start_game(room):
 
     # プレイヤーそれぞれに手札情報を送信
     for player in waiting_players:
-        await player.ws.send_json({"type": "deal", "your_hand": player.hand})
+        await player.send_json({"type": "deal", "your_hand": player.hand})
 
     # 全体にゲーム開始 & 現在のターン情報
     await room.broadcast({
@@ -2186,6 +2285,7 @@ async def start_game(room):
     await room.update_game_state()
     # チャットにログを流す
     await room.log_chat("ゲーム開始！")
+    await maybe_schedule_cpu_turn(room)
 
 
 ################################################
@@ -2227,3 +2327,4 @@ async def next_turn(room):
     # 次のプレイヤー名を取得して送信
     next_player = next((p for p in room.players if p.id == room.current_turn_id), None)
     await broadcast_turn_update(room, next_player.name if next_player else None)
+    await maybe_schedule_cpu_turn(room)
