@@ -5,7 +5,14 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 from rules import PRESETS, RulePreset, DeckRule, PenaltyRule, PrimeRule
 from registered_primes import parse_registered_composite_text, parse_registered_prime_text
-from cpu_player import CpuPlayer, choose_cpu_action, is_cpu_player
+from cpu_player import (
+    CpuPlayer,
+    CpuProfile,
+    available_cpu_profile_payloads,
+    choose_profile_cpu_action,
+    get_cpu_profile,
+    is_cpu_player,
+)
 import json
 import random
 from random import randrange
@@ -19,6 +26,7 @@ import time
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 SERVER_DIR = Path(__file__).resolve().parent
 SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
+REGISTERED_TOURNAMENT_JSON = SERVER_DIR / "registered_prime_daifugo_plus_ge4.json"
 app = FastAPI()
 
 ASSIST_LIMITS = {
@@ -273,6 +281,7 @@ class Room:
             "prime_rule": self.rule.prime_rule.name.lower(),
             "assist_enabled": self.rule.assist_enabled,
             "registration_enabled": self.rule.registration_enabled,
+            "cpu_profiles": available_cpu_profile_payloads(self.rule),
             "count": len(self.players),
             "player_list": [
                 {
@@ -280,6 +289,7 @@ class Room:
                     "name": p.name,
                     "status": p.status,
                     "is_cpu": is_cpu_player(p),
+                    "cpu_key": getattr(p, "cpu_key", None),
                     "registered_prime_count": len(p.registered_primes),
                     "registered_composite_count": len(p.registered_composites),
                 }
@@ -315,6 +325,7 @@ class Room:
                     "name": p.name,
                     "status": p.status,
                     "is_cpu": is_cpu_player(p),
+                    "cpu_key": getattr(p, "cpu_key", None),
                     "registered_prime_count": len(p.registered_primes),
                     "registered_composite_count": len(p.registered_composites),
                 }
@@ -698,19 +709,36 @@ def replace_player_registered_numbers_from_text(
     )
     return registered_numbers_update_payload(prime_result, composite_result)
 
-def load_sample_memory() -> tuple[tuple[int, ...], tuple[int, ...], tuple, str, str]:
-    if not SAMPLE_MEMORY_JSON.exists():
+REGISTERED_SAMPLE_DEFS = {
+    "sashimi2024": {
+        "label": "サンプル：さしみ2024",
+        "prime_json": SAMPLE_MEMORY_JSON,
+        "composite_text": None,
+    },
+    "tournament_order": {
+        "label": "サンプル：大会出た順",
+        "prime_json": REGISTERED_TOURNAMENT_JSON,
+        "composite_text": None,
+    },
+}
+DEFAULT_REGISTERED_SAMPLE_KEY = "sashimi2024"
+
+def load_sample_memory_from_files(prime_json: Path, composite_text_path: Optional[Path] = None) -> tuple[tuple[int, ...], tuple[int, ...], tuple, str, str]:
+    if not prime_json.exists():
         return (), (), (), "", ""
-    data = json.loads(SAMPLE_MEMORY_JSON.read_text(encoding="utf-8-sig"))
+    data = json.loads(prime_json.read_text(encoding="utf-8-sig"))
     prime_text = str(data.get("primeText", "")).strip()
-    composite_text = "\n".join(
-        part.strip()
-        for part in (
-            str(data.get("compositeText", "")).strip(),
-            str(data.get("additionalCompositeText", "")).strip(),
+    if composite_text_path is not None and composite_text_path.exists():
+        composite_text = composite_text_path.read_text(encoding="utf-8-sig").strip()
+    else:
+        composite_text = "\n".join(
+            part.strip()
+            for part in (
+                str(data.get("compositeText", "")).strip(),
+                str(data.get("additionalCompositeText", "")).strip(),
+            )
+            if part.strip()
         )
-        if part.strip()
-    )
     values = []
     for line in prime_text.splitlines():
         token = line.strip()
@@ -725,19 +753,52 @@ def load_sample_memory() -> tuple[tuple[int, ...], tuple[int, ...], tuple, str, 
         composite_text,
     )
 
+def load_registered_samples() -> dict:
+    samples = {}
+    for key, definition in REGISTERED_SAMPLE_DEFS.items():
+        samples[key] = {
+            "key": key,
+            "label": definition["label"],
+            "data": load_sample_memory_from_files(
+                definition["prime_json"],
+                definition.get("composite_text"),
+            ),
+        }
+    return samples
+
+REGISTERED_SAMPLES = load_registered_samples()
+
+def registered_sample_options() -> list[dict]:
+    return [
+        {"key": key, "label": sample["label"]}
+        for key, sample in REGISTERED_SAMPLES.items()
+    ]
+
+def registered_sample_for_key(sample_key: str):
+    return REGISTERED_SAMPLES.get(sample_key) or REGISTERED_SAMPLES.get(DEFAULT_REGISTERED_SAMPLE_KEY)
+
 (
     SAMPLE_REGISTERED_PRIMES,
     SAMPLE_REGISTERED_COMPOSITES,
     SAMPLE_REGISTERED_COMPOSITE_ENTRIES,
     SAMPLE_REGISTERED_PRIME_TEXT,
     SAMPLE_REGISTERED_COMPOSITE_TEXT,
-) = load_sample_memory()
+) = registered_sample_for_key(DEFAULT_REGISTERED_SAMPLE_KEY)["data"]
 
-def load_sample_registered_prime_payload(player: "Player") -> dict:
-    player.replace_registered_primes(set(SAMPLE_REGISTERED_PRIMES))
+def load_sample_registered_prime_payload(player: "Player", sample_key: str = DEFAULT_REGISTERED_SAMPLE_KEY) -> dict:
+    sample = registered_sample_for_key(sample_key)
+    if sample is None:
+        primes, composites, composite_entries, prime_text, composite_text = (), (), (), "", ""
+        sample_key = DEFAULT_REGISTERED_SAMPLE_KEY
+        sample_label = ""
+    else:
+        primes, composites, composite_entries, prime_text, composite_text = sample["data"]
+        sample_key = sample["key"]
+        sample_label = sample["label"]
+    player.replace_registered_primes(set(primes))
     player.replace_registered_composites(
-        set(SAMPLE_REGISTERED_COMPOSITES),
-        SAMPLE_REGISTERED_COMPOSITE_ENTRIES,
+        set(composites),
+        composite_entries,
     )
     return {
         "type": "registered_numbers_updated",
@@ -751,8 +812,10 @@ def load_sample_registered_prime_payload(player: "Player") -> dict:
         "composite_errors": [],
         "truncated": False,
         "sample": True,
-        "sample_prime_text": SAMPLE_REGISTERED_PRIME_TEXT,
-        "sample_composite_text": SAMPLE_REGISTERED_COMPOSITE_TEXT,
+        "sample_key": sample_key,
+        "sample_label": sample_label,
+        "sample_prime_text": prime_text,
+        "sample_composite_text": composite_text,
     }
 
 def field_allows_number(room: Room, number: int, card_count: int) -> bool:
@@ -1247,17 +1310,65 @@ def current_turn_player(room: Room):
     return next((p for p in room.players if p.id == room.current_turn_id), None)
 
 
-async def add_cpu_to_room(room: Room, name: str = "CPU") -> CpuPlayer:
+def human_players(room: Room):
+    return [p for p in room.players if not is_cpu_player(p)]
+
+
+async def remove_cpus_if_no_humans(room: Room) -> bool:
+    if human_players(room):
+        return False
+    cpus = [p for p in room.players if is_cpu_player(p)]
+    if not cpus:
+        return False
+    for cpu in cpus:
+        room.players.remove(cpu)
+        cpu.room = None
+        cpu.status = "watching"
+        cpu.clear_hand()
+    await room.log_chat("人間のプレイヤーがいなくなったためCPUが退室しました")
+    await room.update_room_status()
+    return True
+
+
+async def add_cpu_to_room(room: Room, cpu_key: str = "basic", name: str | None = None) -> CpuPlayer:
+    profile = get_cpu_profile(cpu_key)
+    if profile is None:
+        raise ValueError("unknown cpu profile")
+    if not profile.supports_rule(room.rule):
+        raise ValueError("cpu profile does not support this rule")
     cpu_count = sum(1 for p in room.players if is_cpu_player(p))
-    cpu = CpuPlayer(name=f"{name}{cpu_count + 1}" if cpu_count else name)
+    base_name = name or profile.label
+    cpu = CpuPlayer(
+        name=f"{base_name}{cpu_count + 1}" if cpu_count else base_name,
+        cpu_key=profile.key,
+    )
     cpu.room = room
     cpu.status = "waiting"
-    if room.rule.registration_enabled and (SAMPLE_REGISTERED_PRIMES or SAMPLE_REGISTERED_COMPOSITES):
-        load_sample_registered_prime_payload(cpu)
+    apply_cpu_knowledge(cpu, room, profile)
     room.players.append(cpu)
     await room.log_chat(f"{cpu.name}が入室しました")
     await room.update_room_status()
     return cpu
+
+
+def apply_cpu_knowledge(cpu: CpuPlayer, room: Room, profile: CpuProfile) -> None:
+    knowledge = profile.knowledge
+    if knowledge.load_timing == "never":
+        return
+    if knowledge.load_timing == "registration" and not room.rule.registration_enabled:
+        return
+
+    if knowledge.source == "sample":
+        if SAMPLE_REGISTERED_PRIMES or SAMPLE_REGISTERED_COMPOSITES:
+            load_sample_registered_prime_payload(cpu)
+        return
+
+    if knowledge.source == "inline":
+        replace_player_registered_numbers_from_text(
+            cpu,
+            knowledge.prime_text,
+            knowledge.composite_text,
+        )
 
 
 async def remove_cpu_from_room(room: Room) -> bool:
@@ -1291,24 +1402,37 @@ async def run_cpu_turn(room: Room, cpu: CpuPlayer) -> None:
         if room.state != "playing" or room.current_turn_id != cpu.id or cpu not in room.players:
             return
 
-        action = choose_cpu_action(cpu, room, validator=is_valid_prime_for_player)
-        if action.kind == "play_prime":
-            await handle_prime_play(cpu, room, action.payload)
-        elif action.kind == "draw":
-            await draw_card_for_player(cpu, room)
-            followup = choose_cpu_action(cpu, room, validator=is_valid_prime_for_player)
-            if followup.kind == "play_prime" and room.current_turn_id == cpu.id:
+        action = choose_profile_cpu_action(cpu, room, validator=is_valid_prime_for_player)
+        await execute_cpu_action(room, cpu, action)
+        if action.kind == "draw":
+            followup = choose_profile_cpu_action(cpu, room, validator=is_valid_prime_for_player)
+            if followup.kind in ("play_prime", "play_composite") and room.current_turn_id == cpu.id:
                 await asyncio.sleep(0.4)
-                await handle_prime_play(cpu, room, followup.payload)
+                await execute_cpu_action(room, cpu, followup)
             elif room.current_turn_id == cpu.id:
                 await asyncio.sleep(0.4)
                 await pass_turn_for_player(cpu, room)
-        else:
-            await pass_turn_for_player(cpu, room)
     finally:
         room.cpu_turn_running = False
         if room.state == "playing" and room.current_turn_id == cpu.id:
             await maybe_schedule_cpu_turn(room)
+
+
+async def execute_cpu_action(room: Room, cpu: CpuPlayer, action) -> None:
+    if action.kind == "play_prime":
+        await handle_prime_play(cpu, room, action.payload)
+        return
+    if action.kind == "play_composite":
+        if not room.rule.allow_composite:
+            await pass_turn_for_player(cpu, room)
+            return
+        payload = {"mode": "composite", **action.payload}
+        await handle_composite_play(cpu, room, payload)
+        return
+    if action.kind == "draw":
+        await draw_card_for_player(cpu, room)
+        return
+    await pass_turn_for_player(cpu, room)
 
 
 async def draw_card_for_player(player, room: Room) -> bool:
@@ -1397,14 +1521,19 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": "対戦中は登録内容を変更できません。",
                     })
                     continue
-                if not SAMPLE_REGISTERED_PRIMES and not SAMPLE_REGISTERED_COMPOSITES:
+                sample_key = data.get("sample_key", DEFAULT_REGISTERED_SAMPLE_KEY)
+                if not isinstance(sample_key, str):
+                    sample_key = DEFAULT_REGISTERED_SAMPLE_KEY
+                sample = registered_sample_for_key(sample_key)
+                sample_data = sample["data"] if sample else ((), (), (), "", "")
+                if not sample_data[0] and not sample_data[1]:
                     await player.send_json({
                         "type": "error",
                         "message": "サンプル登録メモリがサーバーに見つかりません。",
                     })
                     continue
 
-                await player.send_json(load_sample_registered_prime_payload(player))
+                await player.send_json(load_sample_registered_prime_payload(player, sample_key))
 
                 if player.room:
                     await player.room.update_room_status()
@@ -1418,6 +1547,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 assist_enabled = {rid: room.rule.assist_enabled for rid, room in rooms.items()}
                 registration_enabled = {rid: room.rule.registration_enabled for rid, room in rooms.items()}
                 room_descriptions = {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in rooms}
+                cpu_profiles = {rid: available_cpu_profile_payloads(room.rule) for rid, room in rooms.items()}
                 await websocket.send_json({
                     "type": "room_counts",
                     "counts": counts,
@@ -1428,6 +1558,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     "assist_enabled": assist_enabled,
                     "registration_enabled": registration_enabled,
                     "room_descriptions": room_descriptions,
+                    "registered_sample_options": registered_sample_options(),
+                    "cpu_profiles": cpu_profiles,
                 })
 
             elif msg_type == "join_room":
@@ -1448,6 +1580,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "assist_enabled": room.rule.assist_enabled,
                         "registration_enabled": room.rule.registration_enabled,
                         "description": ROOM_DESCRIPTIONS.get(room.room_id, ""),
+                        "cpu_profiles": available_cpu_profile_payloads(room.rule),
                     })
                     continue
 
@@ -1479,6 +1612,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "assist_enabled": room.rule.assist_enabled,
                     "registration_enabled": room.rule.registration_enabled,
                     "description": ROOM_DESCRIPTIONS.get(room.room_id, ""),
+                    "cpu_profiles": available_cpu_profile_payloads(room.rule),
                 })
 
             elif msg_type == "leave_room":
@@ -1510,7 +1644,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 if len(room.players) >= 10:
                     await player.send_json({"type": "error", "message": "部屋が満員です。"})
                     continue
-                await add_cpu_to_room(room)
+                cpu_key = data.get("cpu_key", "basic")
+                try:
+                    await add_cpu_to_room(room, cpu_key=cpu_key)
+                except ValueError:
+                    await player.send_json({"type": "error", "message": "この部屋では選択したCPUを使用できません。"})
+                    continue
 
             elif msg_type == "remove_cpu":
                 if not player.room:
@@ -2231,6 +2370,8 @@ async def leave_room(player):
 
 
         # 改めて抜けたプレイヤーには各roomの人数を送る機能を追加
+        if await remove_cpus_if_no_humans(room):
+            return
         await room.update_room_status()
 
 
