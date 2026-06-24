@@ -448,14 +448,10 @@ class Player:
 def check_win_condition(room):
     active_players = get_active_players(room)
 
-    # 1. 対戦参加者が1人だけになった場合の特殊勝利
-    if room.state == "playing" and len(active_players) == 1:
-        return active_players[0].name
-
     if len(active_players) == 0:
         return None
 
-    # 2. 現在プレイヤーの手札0枚による通常勝利
+    # 現在プレイヤーの手札0枚による通常勝利
     current_turn_id = room.current_turn_id
     if current_turn_id is None:
         return None
@@ -1404,8 +1400,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 # 対戦待ちプレイヤー確認
                 waiting_players = get_active_players(room)
-                if len(waiting_players) != 2:
-                    await websocket.send_json({"type": "error", "message": "対戦待ちが2人必要です。"})
+                if len(waiting_players) not in (1, 2):
+                    await websocket.send_json({"type": "error", "message": "対戦待ちは1人または2人必要です。"})
                     continue
                 missing_registered = missing_registered_prime_players(room)
                 if missing_registered:
@@ -1499,7 +1495,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 # チャットにパスのログを流す
                 await room.log_chat(f"{player.name}がパスしました")
-                record_score_line(room, f"{player.name}:{score_state_prefix(room)}%")
+                record_score_play_line(room, player, f"{score_state_prefix(room)}%")
                 # 次のターンへ
                 await next_turn(room)
 
@@ -1538,6 +1534,9 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
     # １）ジョーカーだけを単独で出す (グロタンカット相当)
     jokers = [c for c in played_cards if c["suit"] == "X"]
     if len(jokers) == 1 and len(played_cards) == 1:
+        if room.field and len(room.field) != 1:
+            await player.ws.send_json({"type": "error", "message": "ジョーカー1枚出しは、場が空か1枚のときだけ出せます。"})
+            return
         push_to_reserve(room, played_cards)
         # ジョーカー1枚だけ → 場を流す
         player.remove_card(jokers[0])
@@ -2109,7 +2108,7 @@ async def leave_room(player):
         # 退出通知
         await room.log_chat(f"{player.name}が退室しました")
         if room.state == "playing" and player.status == "waiting":
-            record_score_line(room, f"{player.name}:退出")
+            record_score_play_line(room, player, "退出")
         player.clear_hand()
 
         # ゲーム中の特別処理
@@ -2143,11 +2142,10 @@ async def start_game(room):
     room.reverse_order = room.rule.start_revolution     # 革命はルールごとの開始時コンディションに戻す
     room.has_drawn = False         # ドロー済みフラグもクリア
 
-    # 1) 待機中の2人を確定
+    # 1) 待機中のプレイヤーを確定（1人練習または2人対戦）
     waiting_players = get_active_players(room)
-    if len(waiting_players) != 2:
+    if len(waiting_players) not in (1, 2):
         return
-    p1, p2 = waiting_players
     for p in room.players:
         if p not in waiting_players:
             p.clear_hand()
@@ -2155,26 +2153,26 @@ async def start_game(room):
 
     # 2) デッキ生成→配布（プリセット準拠）
     deck = build_deck(room.rule)
-    hands, remaining = shuffle_and_deal(deck, room.rule.hand_size, num_players=2)
-    p1.hand, p2.hand = hands[0], hands[1]
+    hands, remaining = shuffle_and_deal(deck, room.rule.hand_size, num_players=len(waiting_players))
+    for player, hand in zip(waiting_players, hands):
+        player.hand = hand
     room.deck = remaining
 
     room.reserve = []
     room.field = []  # 場のカードは空
     room.last_number = None
     room.score_log = []
-    p1.sort_hand()
-    p2.sort_hand()
-    record_score_line(room, f"{p1.name}:({score_cards_text(p1.hand, sort_cards=True)})")
-    record_score_line(room, f"{p2.name}:({score_cards_text(p2.hand, sort_cards=True)})")
+    for player in waiting_players:
+        player.sort_hand()
+        record_score_line(room, f"{player.name}:({score_cards_text(player.hand, sort_cards=True)})")
     room.state = "playing"
 
     # ランダムに先攻プレイヤー決定
-    room.current_turn_id = random.choice([p1.id, p2.id])
+    room.current_turn_id = random.choice([p.id for p in waiting_players])
 
     # プレイヤーそれぞれに手札情報を送信
-    await p1.ws.send_json({"type": "deal","your_hand": p1.hand})
-    await p2.ws.send_json({"type": "deal","your_hand": p2.hand})
+    for player in waiting_players:
+        await player.ws.send_json({"type": "deal", "your_hand": player.hand})
 
     # 全体にゲーム開始 & 現在のターン情報
     await room.broadcast({
@@ -2206,7 +2204,7 @@ async def next_turn(room):
 
     # 対戦に参加している（statusが"waiting"の）プレイヤーだけを対象とする
     active_players = get_active_players(room)
-    if len(active_players) < 2:
+    if len(active_players) < 1:
         return
 
     if await room.try_end_game():
