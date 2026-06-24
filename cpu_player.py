@@ -10,6 +10,7 @@ from rules import PrimeRule
 
 Card = dict
 NumberValidator = Callable[[int, "CpuPlayer", object], bool]
+CpuActionSelector = Callable[["CpuPlayer", object, Optional[NumberValidator]], "CpuAction"]
 
 
 @dataclass(frozen=True)
@@ -18,8 +19,41 @@ class CpuAction:
     payload: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class CpuKnowledgeSpec:
+    source: str = "none"  # "none" | "sample" | "inline"
+    load_timing: str = "never"  # "never" | "registration" | "always"
+    prime_text: str = ""
+    composite_text: str = ""
+
+
+@dataclass(frozen=True)
+class CpuProfile:
+    key: str
+    label: str
+    description: str
+    rule_keys: tuple[str, ...] = ()
+    prime_rules: tuple[PrimeRule, ...] = ()
+    knowledge: CpuKnowledgeSpec = field(default_factory=CpuKnowledgeSpec)
+    action_selector: Optional[CpuActionSelector] = None
+
+    def supports_rule(self, rule) -> bool:
+        if self.rule_keys and getattr(rule, "key", None) not in self.rule_keys:
+            return False
+        if self.prime_rules and getattr(rule, "prime_rule", None) not in self.prime_rules:
+            return False
+        return True
+
+    def to_payload(self) -> dict:
+        return {
+            "key": self.key,
+            "label": self.label,
+            "description": self.description,
+        }
+
+
 class CpuPlayer:
-    def __init__(self, name: str = "CPU", player_id: Optional[str] = None):
+    def __init__(self, name: str = "CPU", player_id: Optional[str] = None, cpu_key: str = "basic"):
         self.id = player_id or f"cpu-{secrets.token_hex(8)}"
         self.name = name
         self.ws = self
@@ -27,6 +61,7 @@ class CpuPlayer:
         self.status = "watching"
         self.hand: List[Card] = []
         self.is_cpu = True
+        self.cpu_key = cpu_key
         self.registered_primes: set[int] = set()
         self.registered_composites: set[int] = set()
         self.registered_composite_entries = ()
@@ -85,6 +120,29 @@ class CpuPlayer:
 
 def is_cpu_player(player) -> bool:
     return bool(getattr(player, "is_cpu", False))
+
+
+def get_cpu_profile(cpu_key: str) -> Optional[CpuProfile]:
+    return CPU_PROFILES.get(cpu_key)
+
+
+def available_cpu_profiles_for_rule(rule) -> List[CpuProfile]:
+    return [profile for profile in CPU_PROFILES.values() if profile.supports_rule(rule)]
+
+
+def available_cpu_profile_payloads(rule) -> List[dict]:
+    return [profile.to_payload() for profile in available_cpu_profiles_for_rule(rule)]
+
+
+def choose_profile_cpu_action(
+    cpu: CpuPlayer,
+    room,
+    validator: Optional[NumberValidator] = None,
+) -> CpuAction:
+    profile = get_cpu_profile(getattr(cpu, "cpu_key", "basic"))
+    if profile and profile.action_selector:
+        return profile.action_selector(cpu, room, validator)
+    return choose_cpu_action(cpu, room, validator=validator)
 
 
 def choose_cpu_action(
@@ -249,3 +307,13 @@ def is_semiprime(n: int) -> bool:
         if n % divisor == 0:
             return is_prime(divisor) and is_prime(n // divisor)
     return False
+
+
+CPU_PROFILES = {
+    "basic": CpuProfile(
+        key="basic",
+        label="汎用テストCPU",
+        description="弱めですが、通常・四つ子・半素数・登録制限の各ルールで最低限の動作確認に使えるCPUです。",
+        knowledge=CpuKnowledgeSpec(source="sample", load_timing="registration"),
+    ),
+}
