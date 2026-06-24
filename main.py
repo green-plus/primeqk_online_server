@@ -28,6 +28,7 @@ WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 SERVER_DIR = Path(__file__).resolve().parent
 SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
 REGISTERED_TOURNAMENT_JSON = SERVER_DIR / "registered_prime_daifugo_plus_ge4.json"
+GOLD_PRIME_TABLE_JSON = SERVER_DIR / "gold_prime_table_memory.json"
 app = FastAPI()
 
 ASSIST_LIMITS = {
@@ -743,6 +744,11 @@ REGISTERED_SAMPLE_DEFS = {
         "prime_json": REGISTERED_TOURNAMENT_JSON,
         "composite_text": None,
     },
+    "gold_prime_table": {
+        "label": "サンプル：ゴールド素数表",
+        "prime_json": GOLD_PRIME_TABLE_JSON,
+        "composite_text": None,
+    },
 }
 DEFAULT_REGISTERED_SAMPLE_KEY = "sashimi2024"
 
@@ -762,14 +768,10 @@ def load_sample_memory_from_files(prime_json: Path, composite_text_path: Optiona
             )
             if part.strip()
         )
-    values = []
-    for line in prime_text.splitlines():
-        token = line.strip()
-        if token:
-            values.append(int(token))
+    prime_result = parse_registered_prime_text(prime_text)
     composite_result = parse_registered_composite_text(composite_text)
     return (
-        tuple(sorted(set(values))),
+        prime_result.prime_values,
         composite_result.composite_values,
         composite_result.entries,
         prime_text,
