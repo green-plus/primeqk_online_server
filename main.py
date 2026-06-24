@@ -386,6 +386,21 @@ ROOM_DESCRIPTIONS = {
 }
 rooms = {rid: Room(rid, rule, category) for rid, rule, category in ROOM_CONFIG}
 
+def room_counts_payload() -> dict:
+    return {
+        "type": "room_counts",
+        "counts": {room_id: len(room.players) for room_id, room in rooms.items()},
+        "rules": {rid: room.rule.label for rid, room in rooms.items()},
+        "room_categories": {rid: room.category for rid, room in rooms.items()},
+        "allow_composite": {rid: room.rule.allow_composite for rid, room in rooms.items()},
+        "prime_rules": {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()},
+        "assist_enabled": {rid: room.rule.assist_enabled for rid, room in rooms.items()},
+        "registration_enabled": {rid: room.rule.registration_enabled for rid, room in rooms.items()},
+        "room_descriptions": {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in rooms},
+        "registered_sample_options": registered_sample_options(),
+        "cpu_profiles": {rid: available_cpu_profile_payloads(room.rule) for rid, room in rooms.items()},
+    }
+
 class Player:
     def __init__(self, ws: WebSocket):
         self.ws = ws
@@ -1571,28 +1586,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await player.room.update_room_status()
                 continue
             elif msg_type == "get_room_counts":
-                counts = {room_id: len(room.players) for room_id, room in rooms.items()}
-                rules  = {rid: room.rule.label for rid, room in rooms.items()}
-                room_categories = {rid: room.category for rid, room in rooms.items()}
-                allow_composite = {rid: room.rule.allow_composite for rid, room in rooms.items()}
-                prime_rules = {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()}
-                assist_enabled = {rid: room.rule.assist_enabled for rid, room in rooms.items()}
-                registration_enabled = {rid: room.rule.registration_enabled for rid, room in rooms.items()}
-                room_descriptions = {rid: ROOM_DESCRIPTIONS.get(rid, "") for rid in rooms}
-                cpu_profiles = {rid: available_cpu_profile_payloads(room.rule) for rid, room in rooms.items()}
-                await websocket.send_json({
-                    "type": "room_counts",
-                    "counts": counts,
-                    "rules": rules,
-                    "room_categories": room_categories,
-                    "allow_composite": allow_composite,
-                    "prime_rules": prime_rules,
-                    "assist_enabled": assist_enabled,
-                    "registration_enabled": registration_enabled,
-                    "room_descriptions": room_descriptions,
-                    "registered_sample_options": registered_sample_options(),
-                    "cpu_profiles": cpu_profiles,
-                })
+                await websocket.send_json(room_counts_payload())
 
             elif msg_type == "join_room":
                 rid = data["room_id"]
@@ -1617,7 +1611,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if player.room:
-                    await leave_room(player)
+                    await leave_room(player, notify_client=False)
 
                 if len(room.players) >= 10:
                     await websocket.send_json({"type": "error", "message": "部屋が満員です。"})
@@ -1781,10 +1775,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
     except WebSocketDisconnect:
-        await leave_room(player)
+        await leave_room(player, notify_client=False)
     except Exception:
         traceback.print_exc()
-        await leave_room(player)
+        await leave_room(player, notify_client=False)
 
 ################################################
 # カードプレイ時の判定
@@ -2363,8 +2357,10 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 ################################################
 # 部屋からの退出
 ################################################
-async def leave_room(player):
+async def leave_room(player, notify_client: bool = True):
     if player.room is None:
+        if notify_client:
+            await player.send_json(room_counts_payload())
         return
 
     room_id = player.room.room_id
@@ -2385,6 +2381,8 @@ async def leave_room(player):
         player.room = None
         player.status = "watching"
         player.clear_hand()
+    if notify_client:
+        await player.send_json(room_counts_payload())
 
 
 ################################################
