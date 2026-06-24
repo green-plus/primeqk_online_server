@@ -22,6 +22,7 @@ import asyncio
 import os, httpx
 from math import gcd
 import time
+import traceback
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 SERVER_DIR = Path(__file__).resolve().parent
@@ -263,6 +264,7 @@ class Room:
             except Exception as exc:
                 print(f"broadcast failed in {self.room_id}: {exc}")
                 disconnected.append(p)
+        disconnected_waiting = {p.id for p in disconnected if p.status == "waiting"}
         for p in disconnected:
             if p in self.players:
                 self.players.remove(p)
@@ -270,6 +272,12 @@ class Room:
                 p.room = None
                 p.status = "watching"
                 p.clear_hand()
+        if disconnected:
+            if self.state == "playing":
+                for p in disconnected:
+                    if p.id in disconnected_waiting:
+                        record_score_play_line(self, p, "切断")
+            await handle_room_after_player_removed(self)
 
     async def update_room_status(self):
         message = {
@@ -1330,6 +1338,30 @@ async def remove_cpus_if_no_humans(room: Room) -> bool:
     return True
 
 
+async def handle_room_after_player_removed(room: Room, departed_player_id: str | None = None) -> None:
+    if room.state == "playing":
+        active_players = get_active_players(room)
+        if len(active_players) == 1:
+            winner_name = active_players[0].name
+            room.state = "waiting"
+            room.current_turn_id = None
+            await room.broadcast({"type": "game_over", "winner": winner_name, "state": room.state})
+            await room.log_chat(f"{winner_name}が勝利しました")
+            await publish_score_log(room, winner_name)
+        elif len(active_players) == 0:
+            room.state = "waiting"
+            room.current_turn_id = None
+            await room.broadcast({"type": "game_over", "winner": None, "state": room.state})
+            await room.log_chat("対戦者がいなくなったためゲームを終了しました")
+            await publish_score_log(room, None)
+        elif departed_player_id is not None and room.current_turn_id == departed_player_id:
+            await next_turn(room)
+
+    if await remove_cpus_if_no_humans(room):
+        return
+    await room.update_room_status()
+
+
 async def add_cpu_to_room(room: Room, cpu_key: str = "basic", name: str | None = None) -> CpuPlayer:
     profile = get_cpu_profile(cpu_key)
     if profile is None:
@@ -1749,6 +1781,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
     except WebSocketDisconnect:
+        await leave_room(player)
+    except Exception:
+        traceback.print_exc()
         await leave_room(player)
 
 ################################################
@@ -2329,17 +2364,13 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
 # 部屋からの退出
 ################################################
 async def leave_room(player):
-    # デバッグ用にplayer.roomの状態を出力
-    print(f"DEBUG: player.room before leave_room: {player.room}")
-
-    # もしNoneの場合は注意喚起のログも出す
     if player.room is None:
-        print("DEBUG: player.room is None; cannot proceed with leave_room processing")
         return
 
     room_id = player.room.room_id
     if room_id and player in rooms[room_id].players:
         room = player.room
+        departed_player_id = player.id
         rooms[room_id].players.remove(player)
         player.room = None
 
@@ -2349,30 +2380,11 @@ async def leave_room(player):
             record_score_play_line(room, player, "退出")
         player.clear_hand()
 
-        # ゲーム中の特別処理
-        if room.state == "playing":
-            active_players = get_active_players(room)
-            if len(active_players) == 1:
-                winner_name = active_players[0].name
-                room.state = "waiting"
-                room.current_turn_id = None
-                await room.broadcast({"type": "game_over", "winner": winner_name, "state": room.state})
-                await room.log_chat(f"{winner_name}が勝利しました")
-                await publish_score_log(room, winner_name)
-            elif len(active_players) == 0:
-                room.state = "waiting"
-                room.current_turn_id = None
-                await room.broadcast({"type": "game_over", "winner": None, "state": room.state})
-                await room.log_chat("対戦者がいなくなったためゲームを終了しました")
-                await publish_score_log(room, None)
-            elif room.current_turn_id == player.id: # 現在ターンのプレイヤーが切断した場合、次のターンに進める
-                await next_turn(room)
-
-
-        # 改めて抜けたプレイヤーには各roomの人数を送る機能を追加
-        if await remove_cpus_if_no_humans(room):
-            return
-        await room.update_room_status()
+        await handle_room_after_player_removed(room, departed_player_id)
+    else:
+        player.room = None
+        player.status = "watching"
+        player.clear_hand()
 
 
 ################################################
