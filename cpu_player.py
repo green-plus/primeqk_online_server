@@ -185,6 +185,8 @@ def choose_gold_planning_cpu_action(
         action = choose_gold_lead_action(cpu, room, validator)
     if action is not None:
         return action
+    if field:
+        return CpuAction("pass")
 
     cut = choose_57_cut(cpu.hand, room)
     if cut is not None:
@@ -1604,9 +1606,16 @@ CPU_PROFILES = {
     ),
     "gold_planner": CpuProfile(
         key="gold_planner",
-        label="GOLD組み切りCPU",
+        label="ゴールドCPU",
         description="GOLD素数表だけを基本知識として参照し、切り札を温存しながら枚数別に候補を探す試作CPUです。",
-        prime_rules=(PrimeRule.NORMAL, PrimeRule.REGISTERED),
+        rule_keys=(
+            "std-5-1",
+            "std-7-1",
+            "std-11-f",
+            "std-11-f-c",
+            "std-11-n-c",
+            "std-11-n-no-c",
+        ),
         knowledge=CpuKnowledgeSpec(source="gold", load_timing="always"),
         action_selector=choose_gold_planning_cpu_action,
     ),
