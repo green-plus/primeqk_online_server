@@ -1,0 +1,115 @@
+{
+  "formula": "100 - (100 - trump_strength) * resource_index",
+  "immediate_win_trump_strength": 100.0,
+  "trump_strength": {
+    "2": {
+      "default": 50.0,
+      "thresholds": [
+        {"label": "QK以上", "value": 1213, "score": 70.0},
+        {"label": "KQ以上", "value": 1312, "score": 90.0},
+        {"label": "KK", "value": 1313, "score": 99.9}
+      ]
+    },
+    "3": {
+      "default": 40.0,
+      "thresholds": [
+        {"label": "6QJ以上", "value": 61211, "score": 60.0},
+        {"label": "KTJ以上", "value": 131011, "score": 70.0},
+        {"label": "KQK以上", "value": 131213, "score": 85.0},
+        {"label": "KKJ以上", "value": 131311, "score": 97.0},
+        {"label": "KKQ以上", "value": 131312, "score": 98.0}
+      ]
+    },
+    "4": {
+      "default": 40.0,
+      "thresholds": [
+        {"label": "1000000以上", "value": 1000000, "score": 65.0},
+        {"label": "8QTJ以上", "value": 8121011, "score": 75.0},
+        {"label": "KTQJ以上", "value": 13101211, "score": 88.0},
+        {"label": "KJQJ", "value": 13111211, "score": 92.0},
+        {"label": "KJQQ以上", "value": 13111212, "score": 96.0},
+        {"label": "KKJQ以上", "value": 13131112, "score": 99.0},
+        {"label": "KKKQ以上", "value": 13131312, "score": 99.9}
+      ]
+    },
+    "5": {
+      "default": 45.0,
+      "thresholds": [
+        {"label": "10^8以上", "value": 100000000, "score": 70.0},
+        {"label": "9TQTJ以上", "value": 910121011, "score": 78.0},
+        {"label": "KTTQJ以上", "value": 1310101211, "score": 85.0},
+        {"label": "KKQTJ以上", "value": 1313121011, "score": 95.0},
+        {"label": "KKQKJ以上", "value": 1313121311, "score": 99.0}
+      ]
+    },
+    "6": {
+      "default": 55.0,
+      "thresholds": [
+        {"label": "10^10以上", "value": 10000000000, "score": 75.0},
+        {"label": "9QQTTJ以上", "value": 91212101011, "score": 80.0},
+        {"label": "KJTQTJ以上", "value": 131110121011, "score": 88.0},
+        {"label": "KKQQTJ以上", "value": 131312121011, "score": 96.0},
+        {"label": "KKKQQJ以上", "value": 131313121211, "score": 99.9}
+      ]
+    },
+    "7": {
+      "default": 65.0,
+      "thresholds": [
+        {"label": "10^11以上", "value": 100000000000, "score": 80.0},
+        {"label": "KKQJQTJ以上", "value": 13131211121011, "score": 97.0},
+        {"label": "KKKQQJJ以上", "value": 13131312121111, "score": 99.9}
+      ]
+    },
+    "8": {
+      "default": 75.0,
+      "thresholds": [
+        {"label": "10^12以上", "value": 1000000000000, "score": 85.0},
+        {"label": "10^15以上", "value": 1000000000000000, "score": 90.0},
+        {"label": "KKKQJTQJ以上", "value": 1313131211101211, "score": 99.9}
+      ]
+    },
+    "9": {
+      "default": 85.0,
+      "thresholds": [
+        {"label": "10^17以上", "value": 100000000000000000, "score": 92.0},
+        {"label": "KKQQTJTJJ以上", "value": 131312121011101111, "score": 98.0}
+      ]
+    }
+  },
+  "resource_index": {
+    "immediate": {
+      "no_x": 0.0,
+      "x_single_saved": 0.0,
+      "x_finish": 0.0
+    },
+    "trump_finish": {
+      "no_x": 1.0,
+      "x_single_saved": 0.8,
+      "x_finish": 1.0,
+      "x_trump": 1.0
+    },
+    "three_steps": {
+      "no_x": 1.2,
+      "x_single_saved": 1.0,
+      "x_finish": 1.0,
+      "x_trump": 1.2,
+      "x_before_trump": 1.2
+    },
+    "four_steps": {
+      "no_x": 1.5,
+      "x_single_saved": 1.3,
+      "x_finish": 1.4,
+      "x_trump": 1.6,
+      "x_before_trump": 1.7,
+      "x_early": 2.1
+    },
+    "five_or_more": {
+      "no_x": 2.0,
+      "x_single_saved": 1.8,
+      "x_finish": 1.9,
+      "x_trump": 2.0,
+      "x_before_trump": 2.2,
+      "x_early": 2.5
+    }
+  }
+}

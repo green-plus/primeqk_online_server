@@ -1412,6 +1412,10 @@ def apply_cpu_knowledge(cpu: CpuPlayer, room: Room, profile: CpuProfile) -> None
             load_sample_registered_prime_payload(cpu)
         return
 
+    if knowledge.source == "gold":
+        load_sample_registered_prime_payload(cpu, sample_key="gold_prime_table")
+        return
+
     if knowledge.source == "inline":
         replace_player_registered_numbers_from_text(
             cpu,
