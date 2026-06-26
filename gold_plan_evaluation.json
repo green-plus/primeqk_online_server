@@ -103,13 +103,29 @@
       "x_before_trump": 1.7,
       "x_early": 2.1
     },
-    "five_or_more": {
+    "five_steps": {
       "no_x": 2.0,
       "x_single_saved": 1.8,
       "x_finish": 1.9,
       "x_trump": 2.0,
       "x_before_trump": 2.2,
       "x_early": 2.5
+    },
+    "six_steps": {
+      "no_x": 2.1,
+      "x_single_saved": 1.9,
+      "x_finish": 2.0,
+      "x_trump": 2.1,
+      "x_before_trump": 2.3,
+      "x_early": 3.0
+    },
+    "seven_or_more": {
+      "no_x": 2.2,
+      "x_single_saved": 2.0,
+      "x_finish": 2.1,
+      "x_trump": 2.2,
+      "x_before_trump": 2.4,
+      "x_early": 4.0
     }
   }
 }

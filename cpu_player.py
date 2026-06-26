@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from itertools import permutations
 import json
 from pathlib import Path
 import secrets
 from typing import Callable, Iterable, List, Optional
 
-from registered_primes import registered_value_encodings
+from registered_primes import registered_prime_templates_for_hand, registered_value_encodings
 from rules import PrimeRule
 
 
@@ -18,6 +19,8 @@ GOLD_PLAN_MAX_LAST_CANDIDATES = 30
 GOLD_PLAN_MAX_BRANCH_CANDIDATES = 24
 GOLD_PLAN_MAX_RESULTS_PER_COUNT = 3
 GOLD_PLAN_MAX_ALTERNATIVES = 8
+GOLD_PLAN_MAX_RALLY_PREFIX_STEPS = 6
+GOLD_PLAN_MAX_RALLY_STEPS = GOLD_PLAN_MAX_RALLY_PREFIX_STEPS + 1
 GOLD_PLAN_EVALUATION_JSON = Path(__file__).resolve().parent / "gold_plan_evaluation.json"
 
 
@@ -271,16 +274,24 @@ def choose_gold_correction_action(
     if not field_count:
         return choose_gold_lead_action(cpu, room, validator)
 
+    has_saved_plan = bool(getattr(cpu, "gold_active_plan", None))
+
     candidates = dedupe_candidates(gold_plan_candidates(cpu, room, [field_count], validator))
     candidates = [candidate for candidate in candidates if candidate_is_playable(candidate, cpu, room)]
-    if not candidates:
-        clear_gold_active_plan(cpu)
-        return None
+    special_cuts = [
+        candidate
+        for candidate in gold_special_cut_candidates(cpu, room)
+        if candidate_is_playable(candidate, cpu, room)
+    ]
+    if not candidates and not special_cuts:
+        return choose_gold_no_correction_recovery(cpu, room, validator, has_saved_plan)
 
     rng = secrets.SystemRandom()
     sampled = rng.sample(candidates, min(3, len(candidates)))
     best = None
-    for candidate in sampled:
+    # A one-card X or two-card 57 can reset the field.  They are evaluated in
+    # addition to, rather than instead of, the three ordinary correction plays.
+    for candidate in dedupe_candidates(sampled + special_cuts):
         remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
         temp_cpu = temporary_cpu_with_hand(cpu, remaining)
         plan = build_gold_plan(temp_cpu, room_without_field(room), max_steps=20, validator=validator)
@@ -291,11 +302,29 @@ def choose_gold_correction_action(
             best = (key, candidate, plan)
 
     if best is None:
-        clear_gold_active_plan(cpu)
-        return None
+        return choose_gold_no_correction_recovery(cpu, room, validator, has_saved_plan)
 
     set_gold_active_plan(cpu, best[2])
     return candidate_to_action(best[1])
+
+
+def choose_gold_no_correction_recovery(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+    has_saved_plan: bool,
+) -> Optional[CpuAction]:
+    if has_saved_plan:
+        return None
+
+    plan = build_gold_plan(cpu, room_without_field(room), max_steps=20, validator=validator)
+    if is_executable_gold_plan(plan, cpu):
+        set_gold_active_plan(cpu, plan)
+        return None
+
+    if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+        return CpuAction("draw")
+    return None
 
 
 def play_next_gold_plan_step(
@@ -434,11 +463,54 @@ def choose_gold_all_out_or_draw(cpu: CpuPlayer, room) -> Optional[CpuAction]:
     if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
         clear_gold_active_plan(cpu)
         return CpuAction("draw")
+    relief = choose_gold_even_relief_action(cpu, room)
+    if relief is not None:
+        clear_gold_active_plan(cpu)
+        return relief
     forced = build_gold_all_out_payload(cpu.hand, force_random=True)
     if forced is None:
         return None
     clear_gold_active_plan(cpu)
     return CpuAction("play_prime", forced)
+
+
+def choose_gold_even_relief_action(cpu: CpuPlayer, room) -> Optional[CpuAction]:
+    if len(cpu.hand) < 18 or getattr(room, "field", []):
+        return None
+
+    max_cards = min(9, len([card for card in cpu.hand if not is_joker(card)]))
+    candidates = gold_plan_candidates(cpu, room, range(1, max_cards + 1), gold_knowledge_number_validator)
+    candidates = [
+        candidate
+        for candidate in dedupe_candidates(candidates)
+        if not any(
+            is_joker(card) or int(card.get("rank", 0)) in {11, 13}
+            for card in candidate_consumed_cards(candidate)
+        )
+    ]
+    if not candidates:
+        return None
+
+    hand_ratio = gold_even_card_ratio(cpu.hand)
+    ratios = [gold_even_card_ratio(candidate_consumed_cards(candidate)) for candidate in candidates]
+    best_ratio = max(ratios)
+    if best_ratio < hand_ratio:
+        return None
+
+    best = [candidate for candidate, ratio in zip(candidates, ratios) if ratio == best_ratio]
+    return candidate_to_action(secrets.SystemRandom().choice(best))
+
+
+def gold_even_card_ratio(cards: Iterable[Card]) -> float:
+    cards = list(cards)
+    if not cards:
+        return 0.0
+    even_ranks = {2, 4, 5, 6, 8, 10, 12}
+    return sum(
+        1
+        for card in cards
+        if not is_joker(card) and int(card.get("rank", 0)) in even_ranks
+    ) / len(cards)
 
 
 def build_gold_all_out_payload(hand: List[Card], force_random: bool) -> Optional[dict]:
@@ -606,7 +678,7 @@ def build_same_count_gold_plan(
 
     temp_cpu = temporary_cpu_with_hand(cpu, cpu.hand[:])
     steps = []
-    for _ in range(max_steps):
+    for _ in range(min(max_steps, GOLD_PLAN_MAX_RALLY_STEPS)):
         candidate = choose_gold_rally_candidate(temp_cpu, room, rally_count, validator)
         if candidate is None:
             break
@@ -667,8 +739,32 @@ def search_same_count_gold_plans(
                         plan["joker_trump"] = joker_trump
                         results.append(plan)
                     return
-                if len(selected_desc) + 2 >= max_steps:
+                if (
+                    len(selected_desc) >= GOLD_PLAN_MAX_RALLY_PREFIX_STEPS
+                    or len(selected_desc) + 2 >= max_steps
+                ):
                     return
+
+                split_plans = gold_large_finish_split_candidates(
+                    current_cpu,
+                    room,
+                    rally_count,
+                    bound_strength,
+                    validator,
+                )
+                for rally, finish_tail in split_plans:
+                    sequence = list(reversed(selected_desc + [rally])) + [last] + finish_tail
+                    if len(sequence) > max_steps:
+                        continue
+                    plan_key = tuple(candidate_fingerprint(candidate) for candidate in sequence)
+                    if plan_key in seen_plans:
+                        continue
+                    seen_plans.add(plan_key)
+                    plan = finalize_gold_plan(cpu, room, sequence, rally_count)
+                    plan["joker_trump"] = joker_trump
+                    results.append(plan)
+                    if len(results) >= GOLD_PLAN_MAX_RESULTS_PER_COUNT * 2:
+                        return
 
                 branch_candidates = gold_plan_candidates(current_cpu, room, [rally_count], validator)
                 branch_candidates = [
@@ -729,13 +825,7 @@ def choose_gold_finish_candidate(
     room,
     validator: NumberValidator,
 ) -> Optional[dict]:
-    max_cards = min(9, len([card for card in cpu.hand if not is_joker(card)]))
-    candidates = gold_plan_candidates(cpu, room, range(1, max_cards + 1), validator)
-    hand_ids = {card.get("card_id") for card in cpu.hand}
-    finish_candidates = [
-        candidate for candidate in candidates
-        if {card.get("card_id") for card in candidate_consumed_cards(candidate)} == hand_ids
-    ]
+    finish_candidates = direct_gold_finish_candidates(cpu, room, validator)
     if len(cpu.hand) == 1 and is_joker(cpu.hand[0]):
         finish_candidates.append({
             "kind": "prime",
@@ -750,6 +840,128 @@ def choose_gold_finish_candidate(
     return max(finish_candidates, key=lambda candidate: gold_plan_candidate_score(candidate, room))
 
 
+def direct_gold_finish_candidates(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> list[dict]:
+    candidates = direct_prime_finish_candidates(cpu, room, validator)
+    candidates.extend(direct_composite_finish_candidates(cpu, room))
+    return dedupe_candidates(candidates)
+
+
+def direct_prime_finish_candidates(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> list[dict]:
+    non_joker_ranks = [int(card.get("rank", 0)) for card in cpu.hand if not is_joker(card)]
+    joker_count = len(cpu.hand) - len(non_joker_ranks)
+    templates = registered_prime_templates_for_hand(
+        cpu.registered_primes,
+        non_joker_ranks,
+        joker_count=joker_count,
+        max_cards=9,
+    )
+    hand_ids = {card.get("card_id") for card in cpu.hand}
+    candidates = []
+    seen_numbers = set()
+    for number, ranks in templates:
+        if number in seen_numbers:
+            continue
+        if not validator(number, cpu, getattr(room, "rule", None)):
+            continue
+        if joker_count:
+            realization = cards_for_ranks_with_jokers(cpu.hand, ranks)
+            if realization is None:
+                continue
+            cards = realization["cards"]
+            assigned_numbers = realization["assigned_numbers"]
+        else:
+            cards = cards_for_ranks(cpu.hand, ranks)
+            if cards is None:
+                continue
+            assigned_numbers = []
+        if {card.get("card_id") for card in cards} != hand_ids:
+            continue
+        if not beats_field(number, len(cards), room):
+            continue
+        seen_numbers.add(number)
+        candidates.append({
+            "kind": "prime",
+            "number": number,
+            "cards": cards,
+            "assigned_numbers": assigned_numbers,
+            "ranks": ranks,
+        })
+    return candidates
+
+
+@lru_cache(maxsize=32)
+def direct_composite_templates(entries: tuple, values: tuple[int, ...]) -> dict[tuple[int, ...], tuple[tuple[int, tuple[int, ...], object], ...]]:
+    by_value = {}
+    for entry in entries:
+        by_value.setdefault(entry.value, []).append(entry)
+
+    by_signature = {}
+    for value in values:
+        for visible_ranks in registered_value_encodings(value, max_cards=4):
+            if not 2 <= len(visible_ranks) <= 4:
+                continue
+            for entry in by_value.get(value, []):
+                material_ranks = tuple(
+                    rank
+                    for token in entry.expression_tokens
+                    if token.kind == "cards"
+                    for rank in token.ranks
+                )
+                signature = tuple(sorted(visible_ranks + material_ranks))
+                by_signature.setdefault(signature, []).append((value, visible_ranks, entry))
+    return {
+        signature: tuple(dict.fromkeys(templates))
+        for signature, templates in by_signature.items()
+    }
+
+
+def direct_composite_finish_candidates(cpu: CpuPlayer, room) -> list[dict]:
+    if not getattr(getattr(room, "rule", None), "allow_composite", False):
+        return []
+    if any(is_joker(card) for card in cpu.hand):
+        return []
+
+    signature = tuple(sorted(int(card.get("rank", 0)) for card in cpu.hand))
+    templates = direct_composite_templates(
+        tuple(cpu.registered_composite_entries),
+        tuple(sorted(cpu.registered_composites)),
+    ).get(signature, ())
+    hand_ids = {card.get("card_id") for card in cpu.hand}
+    candidates = []
+    for value, visible_ranks, entry in templates:
+        visible_cards = cards_for_ranks(cpu.hand, visible_ranks)
+        if visible_cards is None:
+            continue
+        material = material_for_composite_entry(cpu.hand, entry, visible_cards)
+        if material is None:
+            continue
+        candidate = {
+            "kind": "composite",
+            "number": value,
+            "cards": visible_cards,
+            "assigned_numbers": [],
+            "consume_cards": material["cards"],
+            "composite_tokens": material["tokens"],
+            "composite_assigned_numbers": [],
+            "expression": material.get("expression", ""),
+            "expression_source": material.get("source", "registered"),
+            "ranks": visible_ranks,
+        }
+        if {card.get("card_id") for card in candidate_consumed_cards(candidate)} != hand_ids:
+            continue
+        if beats_field(value, len(visible_cards), room):
+            candidates.append(candidate)
+    return candidates
+
+
 def choose_gold_finish_tail(
     cpu: CpuPlayer,
     room,
@@ -760,8 +972,7 @@ def choose_gold_finish_tail(
         finish["role"] = "finish"
         return [finish]
 
-    cut = choose_gold_cut_candidate(cpu, room)
-    if cut is not None:
+    for cut in gold_special_cut_candidates(cpu, room):
         after_cut = temporary_cpu_with_hand(cpu, remaining_cards(cpu.hand, candidate_consumed_cards(cut)))
         finish = choose_gold_finish_candidate(after_cut, room, validator)
         if finish is not None:
@@ -772,27 +983,134 @@ def choose_gold_finish_tail(
 
 
 def choose_gold_cut_candidate(cpu: CpuPlayer, room) -> Optional[dict]:
+    candidates = gold_special_cut_candidates(cpu, room)
+    return candidates[0] if candidates else None
+
+
+def gold_special_cut_candidates(cpu: CpuPlayer, room) -> list[dict]:
+    candidates = []
     cut = choose_57_cut(cpu.hand, room)
     if cut is not None and len(cut["cards"]) < len(cpu.hand):
-        return {
+        candidates.append({
             "kind": "prime",
             "number": 57,
             "cards": cut["cards"],
             "assigned_numbers": cut.get("assigned_numbers", []),
             "ranks": (5, 7),
-        }
+        })
 
     joker = single_joker(cpu.hand)
     field_count = len(getattr(room, "field", []) or [])
     if joker is not None and field_count <= 1 and len(cpu.hand) > 1:
-        return {
+        candidates.append({
             "kind": "prime",
             "number": "X",
             "cards": [joker],
             "assigned_numbers": [],
             "ranks": (),
-        }
-    return None
+        })
+    return candidates
+
+
+def gold_large_finish_split_candidates(
+    cpu: CpuPlayer,
+    room,
+    rally_count: int,
+    bound_strength: int,
+    validator: NumberValidator,
+) -> list[tuple[dict, list[dict]]]:
+    """Find a rally-sized opening whose complement is a larger finishing tail."""
+    finish_count = len(cpu.hand) - rally_count
+    if finish_count <= rally_count:
+        return []
+
+    results = []
+    for finish_tail in gold_finish_tails_for_consumed_count(cpu, room, finish_count, validator):
+        consumed = [card for step in finish_tail for card in candidate_consumed_cards(step)]
+        remaining = remaining_cards(cpu.hand, consumed)
+        if len(remaining) != rally_count:
+            continue
+
+        rally_cpu = temporary_cpu_with_hand(cpu, remaining)
+        rallies = gold_plan_candidates(rally_cpu, room, [rally_count], validator)
+        rallies = [
+            candidate
+            for candidate in rallies
+            if len(candidate_consumed_cards(candidate)) == rally_count
+            and candidate_strength(candidate, room) < bound_strength
+        ]
+        for rally in sorted(
+            dedupe_candidates(rallies),
+            key=lambda candidate: gold_plan_candidate_score(candidate, room),
+            reverse=True,
+        ):
+            results.append((rally, finish_tail))
+            if len(results) >= GOLD_PLAN_MAX_BRANCH_CANDIDATES:
+                return results
+    return results
+
+
+def gold_finish_tails_for_consumed_count(
+    cpu: CpuPlayer,
+    room,
+    target_count: int,
+    validator: NumberValidator,
+) -> list[list[dict]]:
+    if target_count < 1 or target_count >= len(cpu.hand):
+        return []
+
+    tails = []
+    for finish in gold_finish_candidates(cpu, room, validator):
+        if len(candidate_consumed_cards(finish)) != target_count:
+            continue
+        finish = dict(finish)
+        finish["role"] = "finish"
+        tails.append([finish])
+
+    for cut in gold_special_cut_candidates(cpu, room):
+        cut_cards = candidate_consumed_cards(cut)
+        after_cut = temporary_cpu_with_hand(cpu, remaining_cards(cpu.hand, cut_cards))
+        for finish in gold_finish_candidates(after_cut, room, validator):
+            if len(cut_cards) + len(candidate_consumed_cards(finish)) != target_count:
+                continue
+            cut = dict(cut)
+            cut["role"] = "cut"
+            finish = dict(finish)
+            finish["role"] = "finish"
+            tails.append([cut, finish])
+
+    seen = set()
+    unique_tails = []
+    for tail in tails:
+        key = tuple(candidate_fingerprint(candidate) for candidate in tail)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_tails.append(tail)
+    return unique_tails
+
+
+def gold_finish_candidates(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> list[dict]:
+    max_cards = min(9, len([card for card in cpu.hand if not is_joker(card)]))
+    candidates = gold_plan_candidates(cpu, room, range(1, max_cards + 1), validator)
+    candidates.extend(
+        candidate
+        for count in range(1, max_cards + 1)
+        for candidate in joker_prime_candidates_for_count(cpu, room, count, validator)
+    )
+    if len(cpu.hand) == 1 and is_joker(cpu.hand[0]):
+        candidates.append({
+            "kind": "prime",
+            "number": "X",
+            "cards": cpu.hand[:],
+            "assigned_numbers": [],
+            "ranks": (),
+        })
+    return dedupe_candidates(candidates)
 
 
 def joker_prime_finish_candidates(
@@ -1044,7 +1362,11 @@ def gold_plan_step_category(plan: dict) -> str:
         return "three_steps"
     if len(steps) == 4:
         return "four_steps"
-    return "five_or_more"
+    if len(steps) == 5:
+        return "five_steps"
+    if len(steps) == 6:
+        return "six_steps"
+    return "seven_or_more"
 
 
 def gold_plan_x_role(plan: dict) -> str:

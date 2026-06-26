@@ -5,7 +5,9 @@ import csv
 import json
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import combinations, product
 from io import StringIO
+from collections import defaultdict
 
 
 FACE_VALUES = {"t": 10, "j": 11, "q": 12, "k": 13}
@@ -18,6 +20,9 @@ MAX_REGISTERED_PRIME_TEXT_LENGTH = 200_000
 MAX_REGISTERED_PRIMES = 20_000
 MAX_REGISTERED_PRIME_DIGITS = 72
 MAX_ONE_CARDS_IN_PRIME_ENCODING = 4
+MAX_COMPOSITE_AUTO_RANK_COPIES = 4
+MAX_COMPOSITE_AUTO_EXPONENT = 122
+MAX_COMPOSITE_AUTO_FACTOR_TRIAL = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,14 @@ class RegisteredCompositeEntry:
     expression_tokens: tuple[RegisteredCompositeExpressionToken, ...]
 
 
+@dataclass(frozen=True)
+class RegisteredPrimeTemplateIndex:
+    """Reusable lookup for matching registered numbers by physical-card ranks."""
+    exact_by_signature: dict[tuple[int, ...], tuple[tuple[int, tuple[int, ...]], ...]]
+    by_visible_signature: dict[tuple[int, tuple[int, ...]], tuple[tuple[int, tuple[int, ...]], ...]]
+    templates_by_card_count: dict[int, tuple[tuple[int, tuple[int, ...]], ...]]
+
+
 def tokenize_registered_prime_pattern(pattern: str) -> tuple[int, ...]:
     """Convert pasted physical-card notation to ranks.
 
@@ -112,6 +125,96 @@ def registered_cards_label(cards: tuple[int, ...]) -> str:
 
 def registered_prime_encoding_allowed(cards: tuple[int, ...]) -> bool:
     return cards.count(1) <= MAX_ONE_CARDS_IN_PRIME_ENCODING
+
+
+@lru_cache(maxsize=32)
+def registered_prime_template_index(
+    values: tuple[int, ...],
+    max_cards: int = 9,
+    max_jokers: int = 2,
+) -> RegisteredPrimeTemplateIndex:
+    """Build a cached physical-card index for one registered-prime knowledge set.
+
+    The exact signature handles ordinary hands.  The visible signature removes
+    one or two ranks from a template, allowing the same index to answer joker
+    substitutions without scanning every registered number again.
+    """
+    exact = defaultdict(list)
+    visible = defaultdict(list)
+    by_count = defaultdict(list)
+    for value in values:
+        for cards in registered_value_encodings(value, max_cards=max_cards):
+            signature = tuple(sorted(cards))
+            template = (value, cards)
+            exact[signature].append(template)
+            by_count[len(cards)].append(template)
+            for joker_count in range(1, min(max_jokers, len(cards)) + 1):
+                seen_visible = set()
+                for omitted_indices in combinations(range(len(cards)), joker_count):
+                    omitted = set(omitted_indices)
+                    visible_signature = tuple(
+                        rank for index, rank in enumerate(signature)
+                        if index not in omitted
+                    )
+                    if visible_signature in seen_visible:
+                        continue
+                    seen_visible.add(visible_signature)
+                    visible[(joker_count, visible_signature)].append(template)
+
+    def freeze(mapping):
+        return {
+            key: tuple(dict.fromkeys(templates))
+            for key, templates in mapping.items()
+        }
+
+    return RegisteredPrimeTemplateIndex(
+        exact_by_signature=freeze(exact),
+        by_visible_signature=freeze(visible),
+        templates_by_card_count=freeze(by_count),
+    )
+
+
+@lru_cache(maxsize=8192)
+def _registered_prime_templates_for_hand(
+    values: tuple[int, ...],
+    signature: tuple[int, ...],
+    joker_count: int,
+    max_cards: int,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    total_count = len(signature) + joker_count
+    if total_count > max_cards:
+        return ()
+    index = registered_prime_template_index(values, max_cards=max_cards)
+    if joker_count == 0:
+        return index.exact_by_signature.get(signature, ())
+    if joker_count <= 2:
+        return index.by_visible_signature.get((joker_count, signature), ())
+
+    return tuple(
+        template
+        for template in index.templates_by_card_count.get(total_count, ())
+        if all(signature.count(rank) <= template[1].count(rank) for rank in set(signature))
+    )
+
+
+def registered_prime_templates_for_hand(
+    values,
+    ranks,
+    joker_count: int = 0,
+    max_cards: int = 9,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Return registered templates matching a hand's non-joker rank multiset.
+
+    Calls with an identical knowledge set and rank combination reuse the cached
+    lookup result.  Consumers still realize the returned template against
+    concrete cards, so card IDs and suits remain outside this shared cache.
+    """
+    return _registered_prime_templates_for_hand(
+        tuple(sorted(set(values))),
+        tuple(sorted(ranks)),
+        joker_count,
+        max_cards,
+    )
 
 
 @lru_cache(maxsize=None)
@@ -416,6 +519,124 @@ def parse_registered_composite_expression(expression: str) -> tuple[RegisteredCo
     return tuple(tokens)
 
 
+def generate_composite_expression_entries(
+    value: int,
+    pattern: str,
+    source_line: int,
+) -> tuple[RegisteredCompositeEntry, ...]:
+    factorization = prime_factorization_for_composite_expression(value)
+    if not factorization:
+        return ()
+
+    grouped_options = [
+        grouped_prime_power_terms(prime, exponent)
+        for prime, exponent in factorization
+    ]
+    expressions = set()
+    for grouped in product(*grouped_options):
+        terms = [term for group in grouped for term in group]
+        terms.sort(key=lambda term: (-pow(term[0], term[1]), -term[0], -term[1]))
+        variants = [term_expression_variants(base, exponent) for base, exponent in terms]
+        if not variants or any(not option for option in variants):
+            continue
+        for parts in product(*variants):
+            expressions.add("*".join(parts))
+
+    entries = []
+    for expression in sorted(expressions, key=lambda text: (text.count("*"), len(text), text)):
+        try:
+            expression_tokens = parse_registered_composite_expression(expression)
+        except ValueError:
+            continue
+        if not composite_expression_rank_counts_allowed(expression_tokens):
+            continue
+        entries.append(RegisteredCompositeEntry(
+            source_line=source_line,
+            pattern=pattern,
+            value=value,
+            expression=expression,
+            expression_tokens=expression_tokens,
+        ))
+    return tuple(entries)
+
+
+def composite_expression_rank_counts_allowed(
+    expression_tokens: tuple[RegisteredCompositeExpressionToken, ...],
+) -> bool:
+    counts: dict[int, int] = {}
+    for token in expression_tokens:
+        if token.kind != "cards":
+            continue
+        for rank in token.ranks:
+            counts[rank] = counts.get(rank, 0) + 1
+            if counts[rank] > MAX_COMPOSITE_AUTO_RANK_COPIES:
+                return False
+    return True
+
+
+def prime_factorization_for_composite_expression(value: int) -> tuple[tuple[int, int], ...]:
+    remaining = value
+    factors = []
+    divisor = 2
+    while divisor * divisor <= remaining:
+        if divisor > MAX_COMPOSITE_AUTO_FACTOR_TRIAL:
+            return ()
+        if remaining % divisor:
+            divisor = 3 if divisor == 2 else divisor + 2
+            continue
+        exponent = 0
+        while remaining % divisor == 0:
+            remaining //= divisor
+            exponent += 1
+        if not is_probable_prime_for_registration(divisor):
+            return ()
+        factors.append((divisor, exponent))
+        divisor = 3 if divisor == 2 else divisor + 2
+    if remaining > 1:
+        if not is_probable_prime_for_registration(remaining):
+            return ()
+        factors.append((remaining, 1))
+    return tuple(factors)
+
+
+def grouped_prime_power_terms(prime: int, exponent: int) -> tuple[tuple[tuple[int, int], ...], ...]:
+    return tuple(
+        tuple((prime, part) for part in partition)
+        for partition in integer_partitions(exponent)
+        if all(part <= MAX_COMPOSITE_AUTO_EXPONENT for part in partition)
+    )
+
+
+def integer_partitions(n: int, max_part: int | None = None) -> tuple[tuple[int, ...], ...]:
+    if n == 0:
+        return ((),)
+    if max_part is None or max_part > n:
+        max_part = n
+    out = []
+    for first in range(max_part, 0, -1):
+        for rest in integer_partitions(n - first, first):
+            out.append((first,) + rest)
+    return tuple(out)
+
+
+def term_expression_variants(base: int, exponent: int) -> tuple[str, ...]:
+    base_texts = tuple(
+        registered_cards_label(cards)
+        for cards in registered_value_encodings(base)
+    )
+    if exponent == 1:
+        return base_texts
+    exponent_texts = tuple(
+        registered_cards_label(cards)
+        for cards in registered_value_encodings(exponent)
+    )
+    return tuple(
+        f"{base_text}^{exponent_text}"
+        for base_text in base_texts
+        for exponent_text in exponent_texts
+    )
+
+
 def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult:
     if len(text) > MAX_REGISTERED_PRIME_TEXT_LENGTH:
         return RegisteredCompositeParseResult(
@@ -454,6 +675,7 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
             duplicate_count += 1
         seen_values.add(value)
 
+        explicit_entry_added = False
         if "=" in stripped:
             expression = stripped.split("=", 1)[1].split("|", 1)[0].strip()
             if expression:
@@ -469,6 +691,9 @@ def parse_registered_composite_text(text: str) -> RegisteredCompositeParseResult
                         expression=expression,
                         expression_tokens=expression_tokens,
                     ))
+                    explicit_entry_added = True
+        if not explicit_entry_added:
+            entries.extend(generate_composite_expression_entries(value, token, line_number))
 
         if len(seen_values) > MAX_REGISTERED_PRIMES:
             errors.append(RegisteredPrimeError(line_number, token, "too many composites"))
