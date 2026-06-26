@@ -142,6 +142,15 @@ PRESETS: Dict[str, RulePreset] = {
         allow_composite=True,
         prime_rule=PrimeRule.SEMIPRIME,
     ),
+    "semiprime-11-1-c": RulePreset(
+        key="semiprime-11-1-c",
+        label="半素数: 11枚 / ペナルティ1枚",
+        deck_rule=DeckRule.DEFAULT,
+        hand_size=11,
+        penalty_rule=PenaltyRule.ALWAYS_1,
+        allow_composite=True,
+        prime_rule=PrimeRule.SEMIPRIME,
+    ),
     "registered-11-n": RulePreset(
         key="registered-11-n",
         label="登録制限: 11枚 / 通常 / アシストなし",

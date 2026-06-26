@@ -373,7 +373,16 @@ ROOM_CONFIG = [
     ("room_13", PRESETS["registered-11-n"], "Neo"),
     ("room_14", PRESETS["registered-11-n-assist"], "Neo"),
     ("room_15", PRESETS["neo-assist-11-n-unlimited"], "Neo"),
+    ("event_1", PRESETS["half-7-1-c"], "Events"),
+    ("event_2", PRESETS["half-7-1-c"], "Events"),
+    ("event_3", PRESETS["half-7-1-c"], "Events"),
+    ("event_4", PRESETS["semiprime-11-1-c"], "Events"),
+    ("event_5", PRESETS["semiprime-11-1-c"], "Events"),
+    ("event_6", PRESETS["semiprime-11-1-c"], "Events"),
 ]
+ROOM_CATEGORY_DESCRIPTIONS = {
+    "Events": "イベント「素数大富豪百鬼夜行」不定期開催中。",
+}
 ROOM_DESCRIPTIONS = {
     "room_15": (
         "登録した素数・合成数をもとにアシスト候補を表示する部屋です。"
@@ -393,6 +402,7 @@ def room_counts_payload() -> dict:
         "counts": {room_id: len(room.players) for room_id, room in rooms.items()},
         "rules": {rid: room.rule.label for rid, room in rooms.items()},
         "room_categories": {rid: room.category for rid, room in rooms.items()},
+        "room_category_descriptions": ROOM_CATEGORY_DESCRIPTIONS,
         "allow_composite": {rid: room.rule.allow_composite for rid, room in rooms.items()},
         "prime_rules": {rid: room.rule.prime_rule.name.lower() for rid, room in rooms.items()},
         "assist_enabled": {rid: room.rule.assist_enabled for rid, room in rooms.items()},

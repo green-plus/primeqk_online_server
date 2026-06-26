@@ -1937,6 +1937,8 @@ CPU_PROFILES = {
             "std-11-f-c",
             "std-11-n-c",
             "std-11-n-no-c",
+            "registered-11-n-assist",
+            "neo-assist-11-n-unlimited",
         ),
         knowledge=CpuKnowledgeSpec(source="gold", load_timing="always"),
         action_selector=choose_gold_planning_cpu_action,
