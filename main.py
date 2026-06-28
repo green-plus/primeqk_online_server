@@ -1,4 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 from functools import lru_cache
@@ -24,7 +25,16 @@ from math import gcd
 import time
 import traceback
 
+def int_env(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_JOIN_NOTIFY_LIMIT = int_env("DISCORD_JOIN_NOTIFY_LIMIT", 5)
+DISCORD_JOIN_NOTIFY_WINDOW_SECONDS = int_env("DISCORD_JOIN_NOTIFY_WINDOW_SECONDS", 3600, minimum=1)
 SERVER_DIR = Path(__file__).resolve().parent
 SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
 REGISTERED_TOURNAMENT_JSON = SERVER_DIR / "registered_prime_daifugo_plus_ge4.json"
@@ -1325,6 +1335,10 @@ def build_prime_assist_candidates(player: "Player", room: Room, data: dict) -> d
 # Webhook
 ################################################
 
+_discord_join_notify_times = deque()
+_discord_join_notify_suppressed = 0
+_discord_join_notify_lock = asyncio.Lock()
+
 async def notify_discord(content: str):
     if not WEBHOOK_URL:
         print("⚠️ Webhook URL が設定されていません")
@@ -1336,6 +1350,40 @@ async def notify_discord(content: str):
     except Exception as e:
         # エラーをハンドリング
         print("notify_discord failed:", e)
+
+
+def reserve_discord_join_notification(now: float | None = None) -> tuple[bool, int]:
+    global _discord_join_notify_suppressed
+    if now is None:
+        now = time.monotonic()
+
+    cutoff = now - DISCORD_JOIN_NOTIFY_WINDOW_SECONDS
+    while _discord_join_notify_times and _discord_join_notify_times[0] <= cutoff:
+        _discord_join_notify_times.popleft()
+
+    if DISCORD_JOIN_NOTIFY_LIMIT <= 0:
+        return False, 0
+
+    if len(_discord_join_notify_times) >= DISCORD_JOIN_NOTIFY_LIMIT:
+        _discord_join_notify_suppressed += 1
+        return False, 0
+
+    _discord_join_notify_times.append(now)
+    suppressed = _discord_join_notify_suppressed
+    _discord_join_notify_suppressed = 0
+    return True, suppressed
+
+
+async def notify_discord_join(content: str):
+    async with _discord_join_notify_lock:
+        should_send, suppressed = reserve_discord_join_notification()
+
+    if not should_send:
+        return
+
+    if suppressed:
+        content = f"{content}\n（直近の入室通知 {suppressed} 件を省略しました）"
+    await notify_discord(content)
 
 ################################################
 # CPU処理
@@ -1636,7 +1684,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await room.log_chat(f"{player.name}が入室しました")
                 # 同期処理の後で、バックグラウンドに通知タスクを投げる
                 asyncio.create_task(
-                    notify_discord(f"🎮 {player.name} が {room.room_id}（{room.rule.label}）に参加しました")
+                    notify_discord_join(f"🎮 {player.name} が {room.room_id}（{room.rule.label}）に参加しました")
                 )
 
 
