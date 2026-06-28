@@ -22,6 +22,11 @@ GOLD_PLAN_MAX_ALTERNATIVES = 8
 GOLD_PLAN_MAX_RALLY_PREFIX_STEPS = 6
 GOLD_PLAN_MAX_RALLY_STEPS = GOLD_PLAN_MAX_RALLY_PREFIX_STEPS + 1
 GOLD_PLAN_EVALUATION_JSON = Path(__file__).resolve().parent / "gold_plan_evaluation.json"
+SILVER_PLAN_MAX_RALLY_STEPS = 3
+SILVER_PLAN_MAX_STEPS = SILVER_PLAN_MAX_RALLY_STEPS + 2
+SILVER_RALLY_COUNTS = (1, 2, 3, 4)
+SILVER_EVEN_RANKS = {2, 4, 6, 8, 10, 12}
+SILVER_EVEN_RELIEF_MAX_RATIO_INCREASE = 0.0
 
 
 @dataclass(frozen=True)
@@ -32,8 +37,9 @@ class CpuAction:
 
 @dataclass(frozen=True)
 class CpuKnowledgeSpec:
-    source: str = "none"  # "none" | "sample" | "gold" | "inline"
+    source: str = "none"  # "none" | "sample" | "gold" | "sample_key" | "inline"
     load_timing: str = "never"  # "never" | "registration" | "always"
+    sample_key: str = ""
     prime_text: str = ""
     composite_text: str = ""
 
@@ -78,6 +84,8 @@ class CpuPlayer:
         self.registered_composite_entries = ()
         self.gold_active_plan: Optional[dict] = None
         self.gold_plan_step_index = 0
+        self.silver_active_plan: Optional[dict] = None
+        self.silver_plan_step_index = 0
 
     async def send_json(self, message: dict):
         return None
@@ -204,6 +212,71 @@ def choose_gold_planning_cpu_action(
         return CpuAction("play_prime", {"cards": [joker], "assigned_numbers": []})
 
     return CpuAction("pass")
+
+
+def choose_silver_planning_cpu_action(
+    cpu: CpuPlayer,
+    room,
+    validator: Optional[NumberValidator] = None,
+) -> CpuAction:
+    validator = gold_knowledge_number_validator
+    if getattr(room, "field", []) or []:
+        action = choose_silver_response_action(cpu, room, validator)
+    else:
+        action = choose_silver_lead_action(cpu, room, validator)
+    return action or CpuAction("pass")
+
+
+def choose_silver_lead_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    action = play_next_silver_plan_step(cpu, room)
+    if action is not None:
+        return action
+
+    plan = build_silver_plan(cpu, room_without_field(room), validator=validator)
+    if is_executable_silver_plan(plan, cpu):
+        set_silver_active_plan(cpu, plan)
+        return play_next_silver_plan_step(cpu, room)
+
+    clear_silver_active_plan(cpu)
+    if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+        return CpuAction("draw")
+
+    relief = choose_silver_even_relief_action(cpu, room, validator)
+    if relief is not None:
+        return relief
+    return None
+
+
+def choose_silver_response_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    action = play_next_silver_plan_step(cpu, room)
+    if action is not None:
+        return action
+
+    clear_silver_active_plan(cpu)
+    field_count = len(getattr(room, "field", []) or [])
+    if field_count:
+        plan = build_silver_plan(cpu, room, counts=(field_count,), validator=validator)
+        if is_executable_silver_plan(plan, cpu):
+            set_silver_active_plan(cpu, plan)
+            return play_next_silver_plan_step(cpu, room)
+
+    if silver_waiting_to_finish(cpu, room, validator):
+        return None
+
+    if not getattr(room, "has_drawn", False) and getattr(room, "deck", []):
+        return CpuAction("draw")
+
+    if field_count:
+        return choose_silver_even_relief_action(cpu, room, validator, counts=(field_count,))
+    return None
 
 
 def choose_gold_lead_action(
@@ -411,7 +484,46 @@ def clear_gold_active_plan(cpu: CpuPlayer) -> None:
     cpu.gold_plan_step_index = 0
 
 
+def set_silver_active_plan(cpu: CpuPlayer, plan: dict) -> None:
+    cpu.silver_active_plan = plan
+    cpu.silver_plan_step_index = 0
+
+
+def clear_silver_active_plan(cpu: CpuPlayer) -> None:
+    cpu.silver_active_plan = None
+    cpu.silver_plan_step_index = 0
+
+
+def play_next_silver_plan_step(cpu: CpuPlayer, room) -> Optional[CpuAction]:
+    plan = getattr(cpu, "silver_active_plan", None)
+    if not plan:
+        return None
+
+    steps = plan.get("steps", [])
+    index = getattr(cpu, "silver_plan_step_index", 0)
+    while index < len(steps):
+        candidate = steps[index]
+        if not candidate_cards_available(candidate, cpu):
+            clear_silver_active_plan(cpu)
+            return None
+        if candidate_is_playable(candidate, cpu, room):
+            cpu.silver_plan_step_index = index + 1
+            return candidate_to_action(candidate)
+        break
+
+    if index >= len(steps):
+        clear_silver_active_plan(cpu)
+    return None
+
+
 def is_executable_gold_plan(plan: dict, cpu: CpuPlayer) -> bool:
+    return bool(plan.get("steps")) and bool(plan.get("completed")) and all(
+        candidate_cards_available(step, cpu)
+        for step in plan.get("steps", [])
+    )
+
+
+def is_executable_silver_plan(plan: dict, cpu: CpuPlayer) -> bool:
     return bool(plan.get("steps")) and bool(plan.get("completed")) and all(
         candidate_cards_available(step, cpu)
         for step in plan.get("steps", [])
@@ -511,6 +623,77 @@ def gold_even_card_ratio(cards: Iterable[Card]) -> float:
         for card in cards
         if not is_joker(card) and int(card.get("rank", 0)) in even_ranks
     ) / len(cards)
+
+
+def choose_silver_even_relief_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+    counts: Optional[Iterable[int]] = None,
+) -> Optional[CpuAction]:
+    if counts is None:
+        max_cards = min(9, len([card for card in cpu.hand if not is_joker(card)]))
+        counts = range(1, max_cards + 1)
+
+    candidates = silver_plan_candidates(cpu, room, counts, validator)
+    candidates = [
+        candidate
+        for candidate in dedupe_candidates(candidates)
+        if candidate_is_playable(candidate, cpu, room)
+        and not silver_candidate_uses_joker(candidate)
+    ]
+    if not candidates:
+        return None
+
+    low_count_candidates = [
+        candidate for candidate in candidates if len(candidate.get("cards", [])) in SILVER_RALLY_COUNTS
+    ]
+    trumps = strongest_candidates_by_count(low_count_candidates, room)
+    filtered = []
+    for candidate in candidates:
+        count = len(candidate.get("cards", []))
+        if count in SILVER_RALLY_COUNTS and same_candidate(trumps.get(count), candidate):
+            continue
+        filtered.append(candidate)
+    candidates = filtered
+    if not candidates:
+        return None
+
+    before_ratio = silver_even_card_ratio(cpu.hand)
+    best = None
+    for candidate in candidates:
+        after_cards = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+        after_ratio = silver_even_card_ratio(after_cards)
+        if after_ratio > before_ratio + SILVER_EVEN_RELIEF_MAX_RATIO_INCREASE:
+            continue
+        consumed = candidate_consumed_cards(candidate)
+        key = (
+            before_ratio - after_ratio,
+            silver_even_card_ratio(consumed),
+            len(consumed),
+            candidate_strength(candidate, room),
+        )
+        if best is None or key > best[0]:
+            best = (key, candidate)
+
+    if best is None:
+        return None
+    return candidate_to_action(best[1])
+
+
+def silver_even_card_ratio(cards: Iterable[Card]) -> float:
+    cards = list(cards)
+    if not cards:
+        return 0.0
+    return sum(
+        1
+        for card in cards
+        if not is_joker(card) and int(card.get("rank", 0)) in SILVER_EVEN_RANKS
+    ) / len(cards)
+
+
+def silver_candidate_uses_joker(candidate: dict) -> bool:
+    return any(is_joker(card) for card in candidate_consumed_cards(candidate))
 
 
 def build_gold_all_out_payload(hand: List[Card], force_random: bool) -> Optional[dict]:
@@ -792,6 +975,237 @@ def search_same_count_gold_plans(
 
     results.sort(key=gold_plan_score, reverse=True)
     return results[:GOLD_PLAN_MAX_RESULTS_PER_COUNT]
+
+
+def build_silver_plan(
+    cpu: CpuPlayer,
+    room,
+    counts: Iterable[int] = SILVER_RALLY_COUNTS,
+    validator: Optional[NumberValidator] = None,
+) -> dict:
+    validator = validator or gold_knowledge_number_validator
+    count_tuple = tuple(count for count in counts if count in SILVER_RALLY_COUNTS)
+
+    direct_tail = choose_gold_finish_tail(cpu, room, validator)
+    if direct_tail:
+        return finalize_silver_plan(cpu, room, direct_tail, 0)
+
+    plans = [
+        plan
+        for rally_count in count_tuple
+        for plan in search_same_count_silver_plans(cpu, room, rally_count, validator)
+    ]
+    if plans:
+        plans.sort(key=silver_plan_score, reverse=True)
+        return plans[0]
+    return {
+        "steps": [],
+        "remaining": cpu.hand[:],
+        "completed": False,
+        "rally_count": 0,
+        "evaluation": {"score": 0},
+    }
+
+
+def search_same_count_silver_plans(
+    cpu: CpuPlayer,
+    room,
+    rally_count: int,
+    validator: NumberValidator,
+) -> list[dict]:
+    results = []
+    seen_plans = set()
+    last_candidates = silver_last_rally_candidates(cpu, room, rally_count, validator)
+
+    for last in last_candidates:
+        reserved_hand = remaining_cards(cpu.hand, candidate_consumed_cards(last))
+        reserved_cpu = temporary_cpu_with_hand(cpu, reserved_hand)
+        last_strength = candidate_strength(last, room)
+
+        def visit(current_cpu: CpuPlayer, bound_strength: int, selected_desc: list[dict]) -> None:
+            tail = choose_gold_finish_tail(current_cpu, room_without_field(room), validator)
+            if tail:
+                sequence = list(reversed(selected_desc)) + [last] + tail
+                if silver_sequence_rally_step_count(sequence) <= SILVER_PLAN_MAX_RALLY_STEPS:
+                    key = tuple(candidate_fingerprint(candidate) for candidate in sequence)
+                    if key not in seen_plans:
+                        seen_plans.add(key)
+                        results.append(finalize_silver_plan(cpu, room, sequence, rally_count))
+                return
+
+            if len(selected_desc) >= SILVER_PLAN_MAX_RALLY_STEPS - 1:
+                return
+
+            branch_candidates = silver_plan_candidates(current_cpu, room_without_field(room), (rally_count,), validator)
+            branch_candidates = [
+                candidate
+                for candidate in branch_candidates
+                if len(candidate.get("cards", [])) == rally_count
+                and len(candidate_consumed_cards(candidate)) < len(current_cpu.hand)
+                and candidate_strength(candidate, room) < bound_strength
+                and not silver_candidate_uses_joker(candidate)
+            ]
+            branch_candidates = sorted(
+                dedupe_candidates(branch_candidates),
+                key=lambda candidate: silver_candidate_score(candidate, room),
+                reverse=True,
+            )[:GOLD_PLAN_MAX_BRANCH_CANDIDATES]
+
+            for candidate in branch_candidates:
+                next_hand = remaining_cards(current_cpu.hand, candidate_consumed_cards(candidate))
+                next_cpu = temporary_cpu_with_hand(current_cpu, next_hand)
+                visit(next_cpu, candidate_strength(candidate, room), selected_desc + [candidate])
+
+        visit(reserved_cpu, last_strength, [])
+
+    results.sort(key=silver_plan_score, reverse=True)
+    return results[:GOLD_PLAN_MAX_RESULTS_PER_COUNT]
+
+
+def silver_last_rally_candidates(
+    cpu: CpuPlayer,
+    room,
+    rally_count: int,
+    validator: NumberValidator,
+) -> list[dict]:
+    candidates = silver_plan_candidates(cpu, room, (rally_count,), validator)
+    if rally_count == 1:
+        candidates.extend(silver_single_joker_candidates(cpu, room))
+    candidates = [
+        candidate
+        for candidate in candidates
+        if len(candidate.get("cards", [])) == rally_count
+        and len(candidate_consumed_cards(candidate)) < len(cpu.hand)
+    ]
+    return sorted(
+        dedupe_candidates(candidates),
+        key=lambda candidate: silver_candidate_score(candidate, room),
+        reverse=True,
+    )[:GOLD_PLAN_MAX_LAST_CANDIDATES]
+
+
+def silver_plan_candidates(
+    cpu: CpuPlayer,
+    room,
+    counts: Iterable[int],
+    validator: NumberValidator,
+) -> list[dict]:
+    count_tuple = tuple(counts)
+    candidates = gold_plan_candidates(cpu, room, count_tuple, validator)
+    return dedupe_candidates(candidates)
+
+
+def silver_single_joker_candidates(cpu: CpuPlayer, room) -> list[dict]:
+    joker = single_joker(cpu.hand)
+    if joker is None:
+        return []
+    if len(cpu.hand) <= 1:
+        return []
+    if len(getattr(room, "field", []) or []) > 1:
+        return []
+    return [{
+        "kind": "prime",
+        "number": "X",
+        "cards": [joker],
+        "assigned_numbers": [],
+        "ranks": (),
+    }]
+
+
+def finalize_silver_plan(
+    cpu: CpuPlayer,
+    room,
+    sequence: list[dict],
+    rally_count: int,
+) -> dict:
+    temp_cpu = temporary_cpu_with_hand(cpu, cpu.hand[:])
+    steps = []
+    for candidate in sequence:
+        role = candidate.get("role", f"rally-{rally_count}" if rally_count else "finish")
+        append_gold_plan_step(steps, temp_cpu, candidate, role=role)
+        temp_cpu.hand = remaining_cards(temp_cpu.hand, candidate_consumed_cards(candidate))
+    plan = {
+        "steps": steps,
+        "remaining": temp_cpu.hand,
+        "completed": not temp_cpu.hand,
+        "rally_count": rally_count,
+        "last_rally_strength": gold_plan_last_rally_strength(steps, room),
+    }
+    plan["evaluation"] = evaluate_silver_plan(plan, room)
+    return plan
+
+
+def silver_sequence_rally_step_count(sequence: list[dict]) -> int:
+    return sum(1 for candidate in sequence if str(candidate.get("role", "rally")).startswith("rally"))
+
+
+def evaluate_silver_plan(plan: dict, room) -> dict:
+    steps = [step for step in plan.get("steps", []) if step.get("role") != "cut"]
+    step_count = len(steps)
+    trump = next(
+        (step for step in reversed(steps) if str(step.get("role", "")).startswith("rally-")),
+        steps[-1] if steps else None,
+    )
+    tier = silver_trump_tier(trump) if trump else 0
+    strength = candidate_strength(trump, room) if trump else -1
+    score_tuple = (-step_count, tier, strength)
+    return {
+        "score": step_count * -1000000 + tier * 1000 + min(strength, 999),
+        "score_tuple": score_tuple,
+        "step_count": step_count,
+        "trump_tier": tier,
+        "trump_strength": strength,
+    }
+
+
+def silver_plan_score(plan: dict) -> tuple:
+    evaluation = plan.get("evaluation", {})
+    score_tuple = evaluation.get("score_tuple")
+    if score_tuple is None:
+        score_tuple = (-len(plan.get("steps", [])), 0, -1)
+    return (
+        1 if plan.get("completed") else 0,
+        *score_tuple,
+    )
+
+
+def silver_candidate_score(candidate: dict, room) -> tuple:
+    return (
+        silver_trump_tier(candidate),
+        candidate_strength(candidate, room),
+        -len(candidate_consumed_cards(candidate)),
+    )
+
+
+def silver_trump_tier(candidate: Optional[dict]) -> int:
+    if not candidate:
+        return 0
+    if candidate.get("number") == "X" and len(candidate.get("cards", [])) == 1:
+        return 12
+    try:
+        number = int(candidate.get("number"))
+    except (TypeError, ValueError):
+        return 0
+    count = len(candidate.get("cards", []))
+    thresholds = (
+        (2, 1313, 11),
+        (3, 131311, 10),
+        (4, 13111211, 9),
+        (2, 1213, 8),
+        (3, 131011, 7),
+        (4, 13101211, 6),
+        (3, 61211, 5),
+        (4, 8101211, 4),
+    )
+    for threshold_count, threshold, tier in thresholds:
+        if count == threshold_count and number >= threshold:
+            return tier
+    general = {1: 3, 2: 2, 3: 1, 4: 0}
+    return general.get(count, 0)
+
+
+def silver_waiting_to_finish(cpu: CpuPlayer, room, validator: NumberValidator) -> bool:
+    return bool(choose_gold_finish_tail(cpu, room_without_field(room), validator))
 
 
 def gold_last_rally_candidates(
@@ -1942,5 +2356,26 @@ CPU_PROFILES = {
         ),
         knowledge=CpuKnowledgeSpec(source="gold", load_timing="always"),
         action_selector=choose_gold_planning_cpu_action,
+    ),
+    "silver_planner": CpuProfile(
+        key="silver_planner",
+        label="シルバーCPU",
+        description="シルバー素数表を使い、浅いラリー戦術と偶数消費を優先するCPUです。",
+        rule_keys=(
+            "std-5-1",
+            "std-7-1",
+            "std-11-f",
+            "std-11-f-c",
+            "std-11-n-c",
+            "std-11-n-no-c",
+            "registered-11-n-assist",
+            "neo-assist-11-n-unlimited",
+        ),
+        knowledge=CpuKnowledgeSpec(
+            source="sample_key",
+            load_timing="always",
+            sample_key="silver_prime_table",
+        ),
+        action_selector=choose_silver_planning_cpu_action,
     ),
 }

@@ -39,6 +39,7 @@ SERVER_DIR = Path(__file__).resolve().parent
 SAMPLE_MEMORY_JSON = SERVER_DIR / "sample_memory.json"
 REGISTERED_TOURNAMENT_JSON = SERVER_DIR / "registered_prime_daifugo_plus_ge4.json"
 GOLD_PRIME_TABLE_JSON = SERVER_DIR / "gold_prime_table_memory.json"
+SILVER_PRIME_TABLE_JSON = SERVER_DIR / "silver_prime_table_memory.json"
 app = FastAPI()
 
 ASSIST_LIMITS = {
@@ -769,6 +770,11 @@ REGISTERED_SAMPLE_DEFS = {
         "prime_json": GOLD_PRIME_TABLE_JSON,
         "composite_text": None,
     },
+    "silver_prime_table": {
+        "label": "サンプル：シルバー素数表",
+        "prime_json": SILVER_PRIME_TABLE_JSON,
+        "composite_text": None,
+    },
 }
 DEFAULT_REGISTERED_SAMPLE_KEY = "sashimi2024"
 
@@ -1472,6 +1478,10 @@ def apply_cpu_knowledge(cpu: CpuPlayer, room: Room, profile: CpuProfile) -> None
 
     if knowledge.source == "gold":
         load_sample_registered_prime_payload(cpu, sample_key="gold_prime_table")
+        return
+
+    if knowledge.source == "sample_key":
+        load_sample_registered_prime_payload(cpu, sample_key=knowledge.sample_key)
         return
 
     if knowledge.source == "inline":
