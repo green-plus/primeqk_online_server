@@ -2537,13 +2537,14 @@ def fish_extra_prime_values_from_materials() -> tuple[int, ...]:
 
 def fish_343_material_paths() -> tuple[Path, ...]:
     server_dir = Path(__file__).resolve().parent
-    workspace_dir = server_dir.parents[1]
-    return (
+    candidates = [
         server_dir / "fish_343_primes.txt",
-        workspace_dir / "materials" / "343primes.txt",
         server_dir / "materials" / "343primes.txt",
         server_dir / "343primes.txt",
-    )
+    ]
+    for parent in server_dir.parents:
+        candidates.append(parent / "materials" / "343primes.txt")
+    return tuple(dict.fromkeys(candidates))
 
 
 def parse_fish_343_prime_table(text: str) -> tuple[int, ...]:
