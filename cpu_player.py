@@ -27,6 +27,14 @@ SILVER_PLAN_MAX_STEPS = SILVER_PLAN_MAX_RALLY_STEPS + 2
 SILVER_RALLY_COUNTS = (1, 2, 3, 4)
 SILVER_EVEN_RANKS = {2, 4, 6, 8, 10, 12}
 SILVER_EVEN_RELIEF_MAX_RATIO_INCREASE = 0.0
+FISH_EXTRA_343_PRIME_COUNT = 500
+FISH_343_TOKEN_VALUES = {
+    "t": "10",
+    "j": "11",
+    "q": "12",
+    "k": "13",
+    "y": "343",
+}
 
 
 @dataclass(frozen=True)
@@ -227,6 +235,73 @@ def choose_silver_planning_cpu_action(
     return action or CpuAction("pass")
 
 
+def choose_talkative_fish_cpu_action(
+    cpu: CpuPlayer,
+    room,
+    validator: Optional[NumberValidator] = None,
+) -> CpuAction:
+    validator = gold_knowledge_number_validator
+    priority = choose_fish_343_priority_action(cpu, room, validator)
+    if priority is not None:
+        return priority
+    return choose_silver_planning_cpu_action(cpu, room, validator)
+
+
+def choose_fish_343_priority_action(
+    cpu: CpuPlayer,
+    room,
+    validator: NumberValidator,
+) -> Optional[CpuAction]:
+    field_count = len(getattr(room, "field", []) or [])
+    max_cards = min(9, len([card for card in cpu.hand if not is_joker(card)]))
+    counts = (field_count,) if field_count else range(1, max_cards + 1)
+    candidates = [
+        candidate
+        for candidate in silver_plan_candidates(cpu, room, counts, validator)
+        if candidate_is_playable(candidate, cpu, room)
+        and fish_candidate_mentions_343(candidate)
+    ]
+    if not candidates:
+        return None
+
+    candidates = dedupe_candidates(candidates)
+    best = max(candidates, key=lambda candidate: fish_343_candidate_score(cpu, room, candidate, validator))
+    clear_silver_active_plan(cpu)
+    return candidate_to_action(best)
+
+
+def fish_343_candidate_score(
+    cpu: CpuPlayer,
+    room,
+    candidate: dict,
+    validator: NumberValidator,
+) -> tuple:
+    remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+    has_followup = has_remaining_known_play(cpu, room, remaining, validator)
+    if not getattr(room, "field", []) and not remaining:
+        has_followup = True
+    strength = candidate_strength(candidate, room)
+    if getattr(room, "field", []) or []:
+        strength_key = -strength
+    else:
+        strength_key = -abs(strength)
+    return (
+        1 if has_followup else 0,
+        -len(candidate_consumed_cards(candidate)),
+        strength_key,
+    )
+
+
+def fish_candidate_mentions_343(candidate: dict) -> bool:
+    if "343" in str(candidate.get("number", "")):
+        return True
+    expression = candidate.get("expression") or ""
+    if "343" in str(expression):
+        return True
+    ranks = "".join(str(rank) for rank in candidate.get("ranks", ()))
+    return "343" in ranks
+
+
 def choose_silver_lead_action(
     cpu: CpuPlayer,
     room,
@@ -248,7 +323,7 @@ def choose_silver_lead_action(
     relief = choose_silver_even_relief_action(cpu, room, validator)
     if relief is not None:
         return relief
-    return None
+    return choose_silver_hnp_action(cpu, room)
 
 
 def choose_silver_response_action(
@@ -263,7 +338,13 @@ def choose_silver_response_action(
     clear_silver_active_plan(cpu)
     field_count = len(getattr(room, "field", []) or [])
     if field_count:
-        plan = build_silver_plan(cpu, room, counts=(field_count,), validator=validator)
+        plan = build_silver_plan(
+            cpu,
+            room,
+            counts=(field_count,),
+            validator=validator,
+            prefer_two_step_over_direct=True,
+        )
         if is_executable_silver_plan(plan, cpu):
             set_silver_active_plan(cpu, plan)
             return play_next_silver_plan_step(cpu, room)
@@ -648,11 +729,22 @@ def choose_silver_even_relief_action(
     low_count_candidates = [
         candidate for candidate in candidates if len(candidate.get("cards", [])) in SILVER_RALLY_COUNTS
     ]
-    trumps = strongest_candidates_by_count(low_count_candidates, room)
+    protected_tiers = {
+        count: max(silver_trump_tier(candidate) for candidate in by_count)
+        for count in SILVER_RALLY_COUNTS
+        for by_count in [[
+            candidate for candidate in low_count_candidates
+            if len(candidate.get("cards", [])) == count
+        ]]
+        if by_count
+    }
     filtered = []
     for candidate in candidates:
         count = len(candidate.get("cards", []))
-        if count in SILVER_RALLY_COUNTS and same_candidate(trumps.get(count), candidate):
+        if (
+            count in protected_tiers
+            and not silver_preserves_trump_tier_after_play(cpu, room, candidate, protected_tiers[count], validator)
+        ):
             continue
         filtered.append(candidate)
     candidates = filtered
@@ -681,6 +773,25 @@ def choose_silver_even_relief_action(
     return candidate_to_action(best[1])
 
 
+def silver_preserves_trump_tier_after_play(
+    cpu: CpuPlayer,
+    room,
+    candidate: dict,
+    protected_tier: int,
+    validator: NumberValidator,
+) -> bool:
+    count = len(candidate.get("cards", []))
+    if count not in SILVER_RALLY_COUNTS:
+        return True
+    remaining = remaining_cards(cpu.hand, candidate_consumed_cards(candidate))
+    temp_cpu = temporary_cpu_with_hand(cpu, remaining)
+    remaining_candidates = silver_plan_candidates(temp_cpu, room, (count,), validator)
+    return any(
+        silver_trump_tier(remaining_candidate) >= protected_tier
+        for remaining_candidate in remaining_candidates
+    )
+
+
 def silver_even_card_ratio(cards: Iterable[Card]) -> float:
     cards = list(cards)
     if not cards:
@@ -694,6 +805,91 @@ def silver_even_card_ratio(cards: Iterable[Card]) -> float:
 
 def silver_candidate_uses_joker(candidate: dict) -> bool:
     return any(is_joker(card) for card in candidate_consumed_cards(candidate))
+
+
+def choose_silver_hnp_action(cpu: CpuPlayer, room) -> Optional[CpuAction]:
+    if getattr(room, "field", []) or []:
+        return None
+    if len(cpu.hand) <= 9:
+        payload = build_gold_all_out_payload(cpu.hand, force_random=True)
+        return CpuAction("play_prime", payload) if payload is not None else None
+
+    payload = build_silver_hnp_payload(cpu.hand)
+    return CpuAction("play_prime", payload) if payload is not None else None
+
+
+def build_silver_hnp_payload(hand: List[Card]) -> Optional[dict]:
+    non_jokers = [card for card in hand if not is_joker(card)]
+    if len(non_jokers) < 5:
+        return None
+
+    rng = secrets.SystemRandom()
+    nucleus = choose_silver_hnp_nucleus(non_jokers, rng)
+    if nucleus is None:
+        return None
+
+    remaining = [card for card in non_jokers if card is not nucleus]
+    evens = [card for card in remaining if int(card.get("rank", 0)) in SILVER_EVEN_RANKS]
+    rng.shuffle(evens)
+    odds = silver_hnp_odd_pool(remaining, rng)
+    others = [
+        card
+        for card in remaining
+        if card not in evens and card not in odds
+    ]
+    rng.shuffle(others)
+
+    selected = [nucleus]
+    snapshots = []
+    hand_ratio = silver_even_card_ratio(non_jokers)
+    for card in evens + odds + others:
+        selected.append(card)
+        if len(selected) >= 5:
+            snapshots.append(selected[:])
+
+    if not snapshots:
+        return None
+
+    ratio_ok = [
+        cards for cards in snapshots
+        if silver_even_card_ratio(cards) >= hand_ratio
+    ]
+    for cards in ratio_ok:
+        if hand_rank_sum(cards, joker_value=None) % 3 != 0:
+            return silver_hnp_payload_from_cards(cards, nucleus, rng)
+    if ratio_ok:
+        return silver_hnp_payload_from_cards(ratio_ok[0], nucleus, rng)
+
+    for cards in snapshots:
+        if hand_rank_sum(cards, joker_value=None) % 3 != 0:
+            return silver_hnp_payload_from_cards(cards, nucleus, rng)
+    return silver_hnp_payload_from_cards(snapshots[0], nucleus, rng)
+
+
+def choose_silver_hnp_nucleus(cards: List[Card], rng) -> Optional[Card]:
+    for ranks in ({1, 3, 7, 9}, {11}, {13}, SILVER_EVEN_RANKS):
+        candidates = [card for card in cards if int(card.get("rank", 0)) in ranks]
+        if candidates:
+            return rng.choice(candidates)
+    return rng.choice(cards) if cards else None
+
+
+def silver_hnp_odd_pool(cards: List[Card], rng) -> list[Card]:
+    pool = []
+    for ranks in ({1, 3, 7, 9}, {11}, {13}):
+        candidates = [card for card in cards if int(card.get("rank", 0)) in ranks]
+        rng.shuffle(candidates)
+        pool.extend(candidates)
+    return pool
+
+
+def silver_hnp_payload_from_cards(cards: List[Card], nucleus: Card, rng) -> dict:
+    others = [card for card in cards if card is not nucleus]
+    rng.shuffle(others)
+    return {
+        "cards": others + [nucleus],
+        "assigned_numbers": [],
+    }
 
 
 def build_gold_all_out_payload(hand: List[Card], force_random: bool) -> Optional[dict]:
@@ -982,12 +1178,13 @@ def build_silver_plan(
     room,
     counts: Iterable[int] = SILVER_RALLY_COUNTS,
     validator: Optional[NumberValidator] = None,
+    prefer_two_step_over_direct: bool = False,
 ) -> dict:
     validator = validator or gold_knowledge_number_validator
     count_tuple = tuple(count for count in counts if count in SILVER_RALLY_COUNTS)
 
     direct_tail = choose_gold_finish_tail(cpu, room, validator)
-    if direct_tail:
+    if direct_tail and not prefer_two_step_over_direct:
         return finalize_silver_plan(cpu, room, direct_tail, 0)
 
     plans = [
@@ -998,6 +1195,8 @@ def build_silver_plan(
     if plans:
         plans.sort(key=silver_plan_score, reverse=True)
         return plans[0]
+    if direct_tail:
+        return finalize_silver_plan(cpu, room, direct_tail, 0)
     return {
         "steps": [],
         "remaining": cpu.hand[:],
@@ -2312,6 +2511,73 @@ def is_prime(n: int) -> bool:
     return True
 
 
+@lru_cache(maxsize=1)
+def fish_extra_prime_values() -> tuple[int, ...]:
+    material_values = fish_extra_prime_values_from_materials()
+    if material_values:
+        return material_values
+
+    values = []
+    number = 2
+    while len(values) < FISH_EXTRA_343_PRIME_COUNT:
+        if "343" in str(number) and is_prime(number):
+            values.append(number)
+        number += 1
+    return tuple(values)
+
+
+def fish_extra_prime_values_from_materials() -> tuple[int, ...]:
+    for path in fish_343_material_paths():
+        if path.exists():
+            values = parse_fish_343_prime_table(path.read_text(encoding="utf-8-sig"))
+            if values:
+                return values
+    return ()
+
+
+def fish_343_material_paths() -> tuple[Path, ...]:
+    server_dir = Path(__file__).resolve().parent
+    workspace_dir = server_dir.parents[1]
+    return (
+        server_dir / "fish_343_primes.txt",
+        workspace_dir / "materials" / "343primes.txt",
+        server_dir / "materials" / "343primes.txt",
+        server_dir / "343primes.txt",
+    )
+
+
+def parse_fish_343_prime_table(text: str) -> tuple[int, ...]:
+    values = []
+    seen = set()
+    for raw_line in text.splitlines():
+        token = raw_line.split(" ", 1)[0].strip().lower()
+        if not token:
+            continue
+        try:
+            value = fish_343_pattern_value(token)
+        except ValueError:
+            continue
+        if "343" not in str(value) or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return tuple(values)
+
+
+def fish_343_pattern_value(pattern: str) -> int:
+    parts = []
+    for char in pattern:
+        if char in FISH_343_TOKEN_VALUES:
+            parts.append(FISH_343_TOKEN_VALUES[char])
+        elif char.isdigit():
+            parts.append(char)
+        else:
+            raise ValueError("invalid fish prime token")
+    if not parts:
+        raise ValueError("empty fish prime token")
+    return int("".join(parts))
+
+
 def is_twin_quadruplet_prime(n: int) -> bool:
     if n in {5, 7, 11, 13}:
         return True
@@ -2377,5 +2643,26 @@ CPU_PROFILES = {
             sample_key="silver_prime_table",
         ),
         action_selector=choose_silver_planning_cpu_action,
+    ),
+    "talkative_fish": CpuProfile(
+        key="talkative_fish",
+        label="饒舌な魚CPU",
+        description="シルバー素数表に343入り素数を足し、刺身チャンスを優先するジョークCPUです。",
+        rule_keys=(
+            "std-5-1",
+            "std-7-1",
+            "std-11-f",
+            "std-11-f-c",
+            "std-11-n-c",
+            "std-11-n-no-c",
+            "registered-11-n-assist",
+            "neo-assist-11-n-unlimited",
+        ),
+        knowledge=CpuKnowledgeSpec(
+            source="fish_silver",
+            load_timing="always",
+            sample_key="silver_prime_table",
+        ),
+        action_selector=choose_talkative_fish_cpu_action,
     ),
 }

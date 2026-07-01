@@ -11,6 +11,7 @@ from cpu_player import (
     CpuProfile,
     available_cpu_profile_payloads,
     choose_profile_cpu_action,
+    fish_extra_prime_values,
     get_cpu_profile,
     is_cpu_player,
 )
@@ -1403,12 +1404,52 @@ def human_players(room: Room):
     return [p for p in room.players if not is_cpu_player(p)]
 
 
+def is_talkative_fish_cpu(player) -> bool:
+    return is_cpu_player(player) and getattr(player, "cpu_key", None) == "talkative_fish"
+
+
+def talkative_fish_cpus(room: Room):
+    return [p for p in room.players if is_talkative_fish_cpu(p)]
+
+
+async def log_talkative_fish_message(room: Room, cpu, message: str) -> None:
+    await room.log_chat(message, sender=getattr(cpu, "name", "饒舌な魚CPU"))
+
+
+async def log_talkative_fish_join(room: Room, cpu) -> None:
+    if is_talkative_fish_cpu(cpu):
+        await log_talkative_fish_message(room, cpu, "よろしくお願いしますウオ")
+
+
+async def log_talkative_fish_leave(room: Room, cpu) -> None:
+    if is_talkative_fish_cpu(cpu):
+        await log_talkative_fish_message(room, cpu, "ありがとうございましたウオ")
+
+
+def talkative_fish_sashimi_text(*texts) -> Optional[str]:
+    for text in texts:
+        value = str(text or "")
+        if "343" in value:
+            return value.replace("343", "刺身") + "ウオ"
+    return None
+
+
+async def maybe_log_talkative_fish_sashimi(room: Room, *texts) -> None:
+    message = talkative_fish_sashimi_text(*texts)
+    if message is None:
+        return
+    for cpu in talkative_fish_cpus(room):
+        await log_talkative_fish_message(room, cpu, message)
+
+
 async def remove_cpus_if_no_humans(room: Room) -> bool:
     if human_players(room):
         return False
     cpus = [p for p in room.players if is_cpu_player(p)]
     if not cpus:
         return False
+    for cpu in cpus:
+        await log_talkative_fish_leave(room, cpu)
     for cpu in cpus:
         room.players.remove(cpu)
         cpu.room = None
@@ -1460,6 +1501,7 @@ async def add_cpu_to_room(room: Room, cpu_key: str = "basic", name: str | None =
     apply_cpu_knowledge(cpu, room, profile)
     room.players.append(cpu)
     await room.log_chat(f"{cpu.name}が入室しました")
+    await log_talkative_fish_join(room, cpu)
     await room.update_room_status()
     return cpu
 
@@ -1484,6 +1526,11 @@ def apply_cpu_knowledge(cpu: CpuPlayer, room: Room, profile: CpuProfile) -> None
         load_sample_registered_prime_payload(cpu, sample_key=knowledge.sample_key)
         return
 
+    if knowledge.source == "fish_silver":
+        load_sample_registered_prime_payload(cpu, sample_key=knowledge.sample_key or "silver_prime_table")
+        cpu.replace_registered_primes(set(cpu.registered_primes) | set(fish_extra_prime_values()))
+        return
+
     if knowledge.source == "inline":
         replace_player_registered_numbers_from_text(
             cpu,
@@ -1497,6 +1544,7 @@ async def remove_cpu_from_room(room: Room) -> bool:
     if cpu is None:
         return False
     room.players.remove(cpu)
+    await log_talkative_fish_leave(room, cpu)
     cpu.room = None
     cpu.status = "watching"
     cpu.clear_hand()
@@ -2061,6 +2109,7 @@ async def handle_prime_play(player: Player, room: Room, data: dict) -> None:
 
     # チャットに「素数を出した」ログを流す
     await room.log_chat(f"{player.name}が{number}を出しました")
+    await maybe_log_talkative_fish_sashimi(room, number)
     play_text = score_cards_text(played_cards) + score_joker_suffix(played_cards, assigned_numbers)
     record_score_play_line(room, player, f"{score_prefix}{play_text}{score_win_suffix(player)}")
     await next_turn(room)
@@ -2424,6 +2473,7 @@ async def handle_composite_play(player: Player, room: Room, data: dict) -> None:
         "mode": "composite"
     })
     await room.log_chat(f"{player.name}が{composite_chat_text}を出しました")
+    await maybe_log_talkative_fish_sashimi(room, composite_chat_text, sel_number)
     record_score_play_line(room, player, f"{score_prefix}{score_composite_text}{score_win_suffix(player)}")
     await next_turn(room)
 
