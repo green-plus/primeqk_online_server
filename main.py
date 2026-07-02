@@ -10,6 +10,7 @@ from cpu_player import (
     CpuPlayer,
     CpuProfile,
     available_cpu_profile_payloads,
+    choose_gold_finish_candidate,
     choose_profile_cpu_action,
     fish_extra_prime_values,
     get_cpu_profile,
@@ -366,6 +367,7 @@ class Room:
             self.state = "waiting"
             await self.broadcast({"type": "game_over", "winner": winner, "state": self.state})
             await self.log_chat(f"{winner}が勝利しました")
+            await maybe_log_talkative_fish_game_over(self)
             await publish_score_log(self, winner)
             return True
         return False
@@ -1412,6 +1414,20 @@ def talkative_fish_cpus(room: Room):
     return [p for p in room.players if is_talkative_fish_cpu(p)]
 
 
+TALKATIVE_FISH_GAME_OVER_MESSAGES = (
+    "JやKなどの強いカードを無計画に使うと、後でウオう左往することになるウオ",
+    "KKJとKKQTJの強さはこウオつ付け難いウオ",
+    "好きな数字の並びを含む素数は大きさの割に覚えやすいウオ",
+    "グロタンカットをした後はもう一度ドローできるウオ",
+    "QQから始まる3枚出しは素数にならないウオ",
+    "同じ枚数でも、絵札が多い素数ほど桁数が多くなるウオ",
+    "これが素数なら勝てるのに、と思った組み合わせは知らなくても出してみる価値があるウオ",
+    "好きな食べ物はサーロインステーキだウオ",
+    "「ギョギョって言って」……？　そんな恐れ多い真似はできないウオ……",
+    "ピヨ……？　何のことだウオ……？",
+)
+
+
 async def log_talkative_fish_message(room: Room, cpu, message: str) -> None:
     await room.log_chat(message, sender=getattr(cpu, "name", "饒舌な魚CPU"))
 
@@ -1442,6 +1458,38 @@ async def maybe_log_talkative_fish_sashimi(room: Room, *texts) -> None:
         await log_talkative_fish_message(room, cpu, message)
 
 
+def talkative_fish_turn_start_text(cpu, room: Room) -> Optional[str]:
+    if not is_talkative_fish_cpu(cpu):
+        return None
+    if choose_gold_finish_candidate(cpu, room, is_valid_prime_for_player) is not None:
+        return "よしウオ"
+    opponents = [
+        player
+        for player in get_active_players(room)
+        if player.id != cpu.id
+    ]
+    if any(len(getattr(player, "hand", [])) <= 3 for player in opponents):
+        return "少しきびしくなってきたウオ"
+    if len(getattr(cpu, "hand", [])) >= 12:
+        return "まだまだこれからウオ"
+    return None
+
+
+async def maybe_log_talkative_fish_turn_start(room: Room, cpu) -> None:
+    message = talkative_fish_turn_start_text(cpu, room)
+    if message is not None:
+        await log_talkative_fish_message(room, cpu, message)
+
+
+async def maybe_log_talkative_fish_game_over(room: Room) -> None:
+    for cpu in talkative_fish_cpus(room):
+        await log_talkative_fish_message(
+            room,
+            cpu,
+            random.choice(TALKATIVE_FISH_GAME_OVER_MESSAGES),
+        )
+
+
 async def remove_cpus_if_no_humans(room: Room) -> bool:
     if human_players(room):
         return False
@@ -1469,12 +1517,14 @@ async def handle_room_after_player_removed(room: Room, departed_player_id: str |
             room.current_turn_id = None
             await room.broadcast({"type": "game_over", "winner": winner_name, "state": room.state})
             await room.log_chat(f"{winner_name}が勝利しました")
+            await maybe_log_talkative_fish_game_over(room)
             await publish_score_log(room, winner_name)
         elif len(active_players) == 0:
             room.state = "waiting"
             room.current_turn_id = None
             await room.broadcast({"type": "game_over", "winner": None, "state": room.state})
             await room.log_chat("対戦者がいなくなったためゲームを終了しました")
+            await maybe_log_talkative_fish_game_over(room)
             await publish_score_log(room, None)
         elif departed_player_id is not None and room.current_turn_id == departed_player_id:
             await next_turn(room)
@@ -1571,6 +1621,7 @@ async def run_cpu_turn(room: Room, cpu: CpuPlayer) -> None:
         if room.state != "playing" or room.current_turn_id != cpu.id or cpu not in room.players:
             return
 
+        await maybe_log_talkative_fish_turn_start(room, cpu)
         action = choose_profile_cpu_action(cpu, room, validator=is_valid_prime_for_player)
         await execute_cpu_action(room, cpu, action)
         if action.kind == "draw":
